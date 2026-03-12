@@ -1,3 +1,4 @@
+//oi
 require('dotenv').config();
 
 // Configurar o FFmpeg bundled ANTES de importar @discordjs/voice
