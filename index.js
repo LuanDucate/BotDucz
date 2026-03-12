@@ -278,7 +278,7 @@ async function playLocalFile(message, tmpFile, displayName) {
 
   // Remover reação de loading e adicionar 🎵
   await message.reactions.removeAll().catch(() => {});
-  await message.react('🎵');
+  await message.react('<:petler:1437632444999270481>');
 
   message.reply(`🔊 Tocando: **${displayName || 'som'}**`);
 
