@@ -14,6 +14,7 @@ const {
   entersState,
   StreamType,
 } = require('@discordjs/voice');
+const { spawn, execSync } = require('child_process');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
@@ -23,8 +24,9 @@ const os = require('os');
 // ============================================================
 // Configuração
 // ============================================================
-const PREFIX = '+Ducz';
+const PREFIXES = ['+Ducz', '+d'];
 const MYINSTANTS_REGEX = /https?:\/\/(www\.)?myinstants\.com\/(pt\/)?instant\/[\w\-]+\/?/i;
+const YOUTUBE_REGEX = /https?:\/\/(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)/i;
 
 // ============================================================
 // Cliente Discord
@@ -52,7 +54,11 @@ const guildPlayers = new Map();
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    lib.get(url, (res) => {
+    lib.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    }, (res) => {
       // Seguir redirecionamentos
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchUrl(res.headers.location).then(resolve).catch(reject);
@@ -76,15 +82,13 @@ async function extractMp3Url(pageUrl) {
   const html = await fetchUrl(pageUrl);
 
   // Método 1: Procurar o link de download direto no HTML
-  // Padrão: href="/media/sounds/nome-do-som.mp3"
   const downloadMatch = html.match(/href=["'](\/media\/sounds\/[^"']+\.mp3)["']/i);
   if (downloadMatch) {
     return `https://www.myinstants.com${downloadMatch[1]}`;
   }
 
   // Método 2: Procurar no atributo onclick do botão
-  // Padrão: play('/media/sounds/nome-do-som.mp3')
-  const onclickMatch = html.match(/play\(['"]?(\/media\/sounds\/[^'")\s]+\.mp3)['"]?\)/i);
+  const onclickMatch = html.match(/play\(['"]?(\/media\/sounds\/[^'")\\s]+\.mp3)['"]?\)/i);
   if (onclickMatch) {
     return `https://www.myinstants.com${onclickMatch[1]}`;
   }
@@ -105,7 +109,6 @@ async function extractMp3Url(pageUrl) {
 function downloadMp3(mp3Url) {
   return new Promise((resolve, reject) => {
     const tmpFile = path.join(os.tmpdir(), `botducz_${Date.now()}.mp3`);
-    const lib = mp3Url.startsWith('https') ? https : http;
 
     function doDownload(downloadUrl) {
       const dl = downloadUrl.startsWith('https') ? https : http;
@@ -134,32 +137,285 @@ function downloadMp3(mp3Url) {
 }
 
 /**
+ * Busca um som no MyInstants por texto.
+ * Retorna um objeto { title, pageUrl } do primeiro resultado, ou null se não encontrar.
+ */
+async function searchMyInstants(query) {
+  const searchUrl = `https://www.myinstants.com/pt/search/?name=${encodeURIComponent(query)}`;
+  console.log(`🔍 Buscando no MyInstants: ${searchUrl}`);
+  const html = await fetchUrl(searchUrl);
+
+  // Procurar links de instants nos resultados da busca
+  // Padrão: <a href="/pt/instant/nome-do-som-12345/" ...> ou onclick com play
+  // Os resultados aparecem como botões com links para as páginas dos instants
+  const resultPattern = /href=["'](\/pt\/instant\/[\w\-]+\/)["'][^>]*>([^<]*)/gi;
+  const results = [];
+  let match;
+
+  while ((match = resultPattern.exec(html)) !== null) {
+    const instantPath = match[1];
+    const title = match[2].trim();
+    // Evitar duplicatas
+    if (!results.find(r => r.pageUrl === `https://www.myinstants.com${instantPath}`)) {
+      results.push({
+        title: title || instantPath.split('/').filter(Boolean).pop().replace(/-/g, ' '),
+        pageUrl: `https://www.myinstants.com${instantPath}`,
+      });
+    }
+  }
+
+  // Fallback: procurar por onclick do botão que tem o MP3 direto
+  if (results.length === 0) {
+    const onclickPattern = /onclick=["']play\(['"]?(\/media\/sounds\/[^'")\s]+\.mp3)['"]?\)["']/gi;
+    let onclickMatch;
+    while ((onclickMatch = onclickPattern.exec(html)) !== null) {
+      const mp3Path = onclickMatch[1];
+      const soundName = mp3Path.split('/').pop().replace('.mp3', '').replace(/-/g, ' ').replace(/_/g, ' ');
+      results.push({
+        title: soundName,
+        mp3Url: `https://www.myinstants.com${mp3Path}`,
+      });
+    }
+  }
+
+  if (results.length === 0) {
+    return null;
+  }
+
+  console.log(`✅ Encontrados ${results.length} resultado(s). Primeiro: "${results[0].title}"`);
+  return results[0];
+}
+
+/**
+ * Conecta ao canal de voz (ou reutiliza conexão existente).
+ * Retorna { connection, player }.
+ */
+async function connectToVoice(message) {
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) {
+    throw new Error('VOICE_NOT_CONNECTED');
+  }
+
+  const permissions = voiceChannel.permissionsFor(message.guild.members.me);
+  if (!permissions.has('Connect') || !permissions.has('Speak')) {
+    throw new Error('VOICE_NO_PERMISSION');
+  }
+
+  let playerData = guildPlayers.get(message.guildId);
+  let connection;
+
+  if (playerData && playerData.connection) {
+    connection = playerData.connection;
+    // Se o canal mudou, reconectar
+    if (connection.joinConfig.channelId !== voiceChannel.id) {
+      connection.destroy();
+      connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guildId,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+    }
+  } else {
+    connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: message.guildId,
+      adapterCreator: message.guild.voiceAdapterCreator,
+    });
+  }
+
+  // Aguardar a conexão ficar pronta
+  console.log('🔗 Aguardando conexão de voz ficar pronta...');
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+    console.log('✅ Conexão de voz pronta!');
+  } catch (err) {
+    console.error('❌ Timeout na conexão de voz:', err.message);
+    connection.destroy();
+    guildPlayers.delete(message.guildId);
+    throw new Error('VOICE_TIMEOUT');
+  }
+
+  // Criar player
+  const player = createAudioPlayer();
+
+  // Parar player anterior se existir
+  if (playerData && playerData.player) {
+    playerData.player.stop();
+  }
+
+  // Registrar o player e a conexão
+  guildPlayers.set(message.guildId, { player, connection });
+
+  // Subscriber
+  connection.subscribe(player);
+
+  // Desconectar se a conexão for fechada (usar once para evitar memory leak)
+  connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
+  connection.once(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      connection.destroy();
+      guildPlayers.delete(message.guildId);
+    }
+  });
+
+  return { connection, player };
+}
+
+/**
+ * Toca um áudio de arquivo temporário local no canal de voz.
+ */
+async function playLocalFile(message, tmpFile, displayName) {
+  const { player } = await connectToVoice(message);
+
+  const resource = createAudioResource(tmpFile);
+  player.play(resource);
+
+  // Remover reação de loading e adicionar 🎵
+  await message.reactions.removeAll().catch(() => {});
+  await message.react('🎵');
+
+  message.reply(`🔊 Tocando: **${displayName || 'som'}**`);
+
+  // Quando terminar de tocar (once para evitar memory leak)
+  player.once(AudioPlayerStatus.Idle, () => {
+    console.log('🔇 Áudio finalizado.');
+    fs.unlink(tmpFile, () => {});
+  });
+
+  // Tratamento de erros do player
+  player.once('error', (error) => {
+    console.error('❌ Erro no player:', error.message);
+    console.error('   Stack:', error.stack);
+    fs.unlink(tmpFile, () => {});
+    message.reply('❌ Ocorreu um erro ao reproduzir o áudio.');
+  });
+}
+
+/**
+ * Obtém o título do vídeo do YouTube via yt-dlp.
+ */
+function getYouTubeTitle(url) {
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn('yt-dlp', ['--get-title', '--no-warnings', '--no-playlist', url]);
+      let title = '';
+      proc.stdout.on('data', (data) => (title += data.toString()));
+      proc.on('close', (code) => {
+        resolve(code === 0 && title.trim() ? title.trim() : 'vídeo do YouTube');
+      });
+      proc.on('error', () => resolve('vídeo do YouTube'));
+    } catch {
+      resolve('vídeo do YouTube');
+    }
+  });
+}
+
+/**
+ * Toca um áudio do YouTube no canal de voz usando yt-dlp.
+ */
+async function playYouTube(message, url) {
+  const { player } = await connectToVoice(message);
+
+  console.log(`🎬 Obtendo stream do YouTube via yt-dlp: ${url}`);
+
+  // Obter título do vídeo em paralelo
+  const titlePromise = getYouTubeTitle(url);
+
+  // Iniciar stream de áudio via yt-dlp
+  const ytdlp = spawn('yt-dlp', [
+    '-f', 'bestaudio/best', // fallback para 'best' se 'bestaudio' não existir
+    '-o', '-',
+    '--quiet',
+    '--no-warnings',
+    '--no-playlist',
+    '--extractor-args', 'youtube:player_client=android', // android client costuma ter menos 403
+    url,
+  ]);
+
+  // Tratar erros do processo yt-dlp
+  let ytdlpError = '';
+  ytdlp.stderr.on('data', (data) => {
+    ytdlpError += data.toString();
+    console.error('yt-dlp stderr:', data.toString().trim());
+  });
+
+  ytdlp.on('error', (error) => {
+    console.error('❌ yt-dlp não encontrado:', error.message);
+    message.reply('❌ **yt-dlp** não está instalado! Instale com:\n```\nwinget install yt-dlp\n```');
+  });
+
+  const resource = createAudioResource(ytdlp.stdout, {
+    inputType: StreamType.Arbitrary,
+  });
+
+  player.play(resource);
+
+  const videoTitle = await titlePromise;
+
+  // Remover reação de loading e adicionar 🎶
+  await message.reactions.removeAll().catch(() => {});
+  await message.react('🎶');
+
+  message.reply(`🔊 Tocando do YouTube: **${videoTitle}**`);
+
+  // Quando terminar de tocar (once para evitar memory leak)
+  player.once(AudioPlayerStatus.Idle, () => {
+    console.log('🔇 Áudio do YouTube finalizado.');
+  });
+
+  // Tratamento de erros do player
+  player.once('error', (error) => {
+    console.error('❌ Erro no player (YouTube):', error.message);
+    console.error('   Stack:', error.stack);
+    message.reply('❌ Ocorreu um erro ao reproduzir o áudio do YouTube.');
+  });
+}
+
+/**
  * Constrói o embed de ajuda do bot.
  */
 function buildHelpEmbed() {
   return new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('🎵 BotDucz — Ajuda')
-    .setDescription('Toque sons do **MyInstants** diretamente no canal de voz!')
+    .setDescription('Toque sons do **MyInstants** e **YouTube** diretamente no canal de voz!\n\n💡 Use `+Ducz` ou `+d` como prefixo.')
     .addFields(
       {
-        name: '▶️ Tocar um som',
-        value: '```\n+Ducz <link-do-myinstants>\n```\nExemplo:\n`+Ducz https://www.myinstants.com/pt/instant/briga-de-gato-25101/`',
+        name: '▶️ Tocar um som do MyInstants (link)',
+        value: '```\n+d <link-do-myinstants>\n```\nExemplo: `+d https://www.myinstants.com/pt/instant/briga-de-gato-25101/`',
+      },
+      {
+        name: '🔍 Buscar e tocar um som do MyInstants',
+        value: '```\n+d <descrição do som>\n```\nExemplo: `+d briga de gato`',
+      },
+      {
+        name: '🎬 Tocar áudio do YouTube (link)',
+        value: '```\n+d <link-do-youtube>\n```\nExemplo: `+d https://www.youtube.com/watch?v=dQw4w9WgXcQ`',
+      },
+      {
+        name: '🔎 Buscar e tocar do YouTube',
+        value: '```\n+d yt <nome da música>\n```\nExemplo: `+d yt nirvana smells like teen spirit`',
       },
       {
         name: '⏹️ Parar o áudio',
-        value: '```\n+Ducz parar\n```',
+        value: '```\n+d parar\n```',
       },
       {
         name: '🚪 Sair do canal de voz',
-        value: '```\n+Ducz sair\n```',
+        value: '```\n+d sair\n```',
       },
       {
         name: '❓ Mostrar ajuda',
-        value: '```\n+Ducz ajuda\n```',
+        value: '```\n+d ajuda\n```',
       }
     )
-    .setFooter({ text: 'BotDucz • Sons do MyInstants no Discord' });
+    .setFooter({ text: 'BotDucz • Sons do MyInstants e YouTube no Discord' });
 }
 
 // ============================================================
@@ -168,19 +424,31 @@ function buildHelpEmbed() {
 client.once('ready', () => {
   console.log(`✅ BotDucz está online como ${client.user.tag}`);
   console.log(`📡 Conectado a ${client.guilds.cache.size} servidor(es)`);
-  client.user.setActivity('+Ducz ajuda', { type: 2 }); // type 2 = "Listening"
+  client.user.setActivity('+d ajuda', { type: 2 }); // type 2 = "Listening"
 });
 
 // ============================================================
 // Evento: Mensagem recebida
 // ============================================================
 client.on('messageCreate', async (message) => {
-  // Ignorar mensagens de bots e sem o prefixo correto
+  // Ignorar mensagens de bots
   if (message.author.bot) return;
-  if (!message.content.startsWith(PREFIX)) return;
+
+  // Verificar qual prefixo foi usado (+Ducz ou +d)
+  let usedPrefix = null;
+  for (const p of PREFIXES) {
+    if (message.content.toLowerCase().startsWith(p.toLowerCase())) {
+      // Garantir que +d não captura +Ducz (verificar se o próximo char não é letra)
+      const nextChar = message.content[p.length];
+      if (p.toLowerCase() === '+d' && nextChar && /[a-zA-Z]/.test(nextChar)) continue;
+      usedPrefix = p;
+      break;
+    }
+  }
+  if (!usedPrefix) return;
 
   // Extrair o argumento após o prefixo
-  const args = message.content.slice(PREFIX.length).trim();
+  const args = message.content.slice(usedPrefix.length).trim();
 
   // Sem argumentos = mostrar ajuda
   if (!args) {
@@ -221,146 +489,105 @@ client.on('messageCreate', async (message) => {
   }
 
   // --------------------------------------------------------
-  // Comando: tocar link do MyInstants
+  // Detectar tipo de input
   // --------------------------------------------------------
-  const url = args.split(/\s+/)[0];
-
-  if (!MYINSTANTS_REGEX.test(url)) {
-    return message.reply(
-      '❌ Link inválido! Use um link do **MyInstants**, por exemplo:\n' +
-        '`+Ducz https://www.myinstants.com/pt/instant/briga-de-gato-25101/`\n\n' +
-        'Digite `+Ducz ajuda` para ver todos os comandos.'
-    );
-  }
-
-  // Verificar se o usuário está em um canal de voz
-  const voiceChannel = message.member?.voice?.channel;
-  if (!voiceChannel) {
-    return message.reply('❌ Você precisa estar em um **canal de voz** para usar este comando!');
-  }
-
-  // Verificar permissões
-  const permissions = voiceChannel.permissionsFor(message.guild.members.me);
-  if (!permissions.has('Connect') || !permissions.has('Speak')) {
-    return message.reply('❌ Não tenho permissão para **conectar** ou **falar** nesse canal de voz!');
-  }
+  const input = args.split(/\s+/)[0];
 
   try {
-    // Indicar que está processando
-    await message.react('🔄');
+    // --------------------------------------------------------
+    // Caso 1: Link do MyInstants
+    // --------------------------------------------------------
+    if (MYINSTANTS_REGEX.test(input)) {
+      await message.react('🔄');
 
-    // 1. Extrair URL do MP3
-    const mp3Url = await extractMp3Url(url);
+      const mp3Url = await extractMp3Url(input);
+      console.log(`🎵 MP3 encontrado: ${mp3Url}`);
+
+      console.log('⬇️ Baixando MP3...');
+      const tmpFile = await downloadMp3(mp3Url);
+      console.log(`✅ MP3 baixado: ${tmpFile}`);
+
+      const soundName = input
+        .replace(/\/$/, '')
+        .split('/')
+        .pop()
+        .replace(/-/g, ' ')
+        .replace(/\d+$/, '')
+        .trim();
+
+      await playLocalFile(message, tmpFile, soundName);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // Caso 2: Link do YouTube
+    // --------------------------------------------------------
+    if (YOUTUBE_REGEX.test(input)) {
+      await message.react('🔄');
+      await playYouTube(message, input);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // Caso 3: Busca no YouTube com "yt <query>"
+    // --------------------------------------------------------
+    if (input.toLowerCase() === 'yt') {
+      const ytQuery = args.slice(2).trim(); // remover "yt" do início
+      if (!ytQuery) {
+        return message.reply('❌ Digite o nome da música! Exemplo: `+d yt nirvana`');
+      }
+      await message.react('🔍');
+      // Usar yt-dlp com ytsearch para buscar e tocar o primeiro resultado
+      await playYouTube(message, `ytsearch1:${ytQuery}`);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // Caso 3: Busca por texto no MyInstants
+    // --------------------------------------------------------
+    await message.react('🔍');
+
+    const searchQuery = args; // usar todo o texto, não apenas a primeira palavra
+    const result = await searchMyInstants(searchQuery);
+
+    if (!result) {
+      await message.reactions.removeAll().catch(() => {});
+      await message.react('❌');
+      return message.reply(`❌ Nenhum som encontrado para: **${searchQuery}**`);
+    }
+
+    // Se o resultado já tem a URL do MP3 direto (do fallback onclick)
+    if (result.mp3Url) {
+      console.log(`🎵 MP3 direto encontrado: ${result.mp3Url}`);
+      const tmpFile = await downloadMp3(result.mp3Url);
+      await playLocalFile(message, tmpFile, result.title);
+      return;
+    }
+
+    // Caso contrário, extrair o MP3 da página do resultado
+    console.log(`🎵 Acessando página: ${result.pageUrl}`);
+    const mp3Url = await extractMp3Url(result.pageUrl);
     console.log(`🎵 MP3 encontrado: ${mp3Url}`);
 
-    // 2. Baixar o MP3 para arquivo temporário
-    console.log('⬇️ Baixando MP3...');
     const tmpFile = await downloadMp3(mp3Url);
     console.log(`✅ MP3 baixado: ${tmpFile}`);
 
-    // 3. Conectar ao canal de voz (ou reutilizar conexão existente)
-    let playerData = guildPlayers.get(message.guildId);
-    let connection;
-
-    if (playerData && playerData.connection) {
-      connection = playerData.connection;
-      // Se o canal mudou, reconectar
-      if (connection.joinConfig.channelId !== voiceChannel.id) {
-        connection.destroy();
-        connection = joinVoiceChannel({
-          channelId: voiceChannel.id,
-          guildId: message.guildId,
-          adapterCreator: message.guild.voiceAdapterCreator,
-        });
-      }
-    } else {
-      connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: message.guildId,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
-    }
-
-    // Aguardar a conexão ficar pronta
-    console.log('🔗 Aguardando conexão de voz ficar pronta...');
-    connection.on('stateChange', (oldState, newState) => {
-      console.log(`  Conexão: ${oldState.status} → ${newState.status}`);
-    });
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-      console.log('✅ Conexão de voz pronta!');
-    } catch (err) {
-      console.error('❌ Timeout na conexão de voz:', err.message);
-      connection.destroy();
-      guildPlayers.delete(message.guildId);
-      fs.unlink(tmpFile, () => {});
-      return message.reply('❌ Não consegui conectar ao canal de voz. Tente novamente.');
-    }
-
-    // 4. Criar player e resource a partir do arquivo baixado
-    const player = createAudioPlayer();
-    const resource = createAudioResource(tmpFile);
-
-    // Parar player anterior se existir
-    if (playerData && playerData.player) {
-      playerData.player.stop();
-    }
-
-    // Registrar o player e a conexão
-    guildPlayers.set(message.guildId, { player, connection });
-
-    // Subscriber e tocar
-    connection.subscribe(player);
-    player.play(resource);
-
-    // Remover reação de loading e adicionar ✅
-    await message.reactions.removeAll().catch(() => {});
-    await message.react('🎵');
-
-    // Extrair nome do som do URL para exibir
-    const soundName = url
-      .replace(/\/$/, '')
-      .split('/')
-      .pop()
-      .replace(/-/g, ' ')
-      .replace(/\d+$/, '')
-      .trim();
-
-    message.reply(`🔊 Tocando: **${soundName || 'som'}**`);
-
-    // Quando terminar de tocar
-    player.on(AudioPlayerStatus.Idle, () => {
-      console.log('🔇 Áudio finalizado.');
-      // Limpar arquivo temporário
-      fs.unlink(tmpFile, () => {});
-    });
-
-    // Tratamento de erros do player
-    player.on('error', (error) => {
-      console.error('❌ Erro no player:', error.message);
-      console.error('   Stack:', error.stack);
-      fs.unlink(tmpFile, () => {});
-      message.reply('❌ Ocorreu um erro ao reproduzir o áudio.');
-    });
-
-    // Desconectar se a conexão for fechada
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-        // Parece estar reconectando
-      } catch {
-        // Desconectou de verdade
-        connection.destroy();
-        guildPlayers.delete(message.guildId);
-      }
-    });
+    await playLocalFile(message, tmpFile, result.title);
   } catch (error) {
     console.error('❌ Erro:', error.message);
     await message.reactions.removeAll().catch(() => {});
     await message.react('❌');
+
+    if (error.message === 'VOICE_NOT_CONNECTED') {
+      return message.reply('❌ Você precisa estar em um **canal de voz** para usar este comando!');
+    }
+    if (error.message === 'VOICE_NO_PERMISSION') {
+      return message.reply('❌ Não tenho permissão para **conectar** ou **falar** nesse canal de voz!');
+    }
+    if (error.message === 'VOICE_TIMEOUT') {
+      return message.reply('❌ Não consegui conectar ao canal de voz. Tente novamente.');
+    }
+
     message.reply(`❌ Erro: ${error.message}`);
   }
 });

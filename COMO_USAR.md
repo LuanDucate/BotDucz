@@ -95,19 +95,33 @@ Você verá no terminal:
 
 | Comando | Descrição |
 |---|---|
-| `+Ducz <link>` | Toca o áudio do MyInstants no canal de voz |
+| `+Ducz <link-myinstants>` | Toca o áudio do MyInstants no canal de voz |
+| `+Ducz <descrição>` | Busca um som no MyInstants por texto e toca o primeiro resultado |
+| `+Ducz <link-youtube>` | Toca o áudio de um vídeo do YouTube |
 | `+Ducz parar` | Para o áudio que está tocando |
 | `+Ducz sair` | Desconecta o bot do canal de voz |
 | `+Ducz ajuda` | Mostra a lista de comandos |
 
-### Exemplo
+### Exemplos
 
 1. Entre em um canal de voz no Discord
-2. No chat, envie:
+
+2. **Tocar um som do MyInstants por link:**
    ```
    +Ducz https://www.myinstants.com/pt/instant/briga-de-gato-25101/
    ```
-3. O bot vai entrar no canal e tocar o som! 🎵
+
+3. **Buscar e tocar um som por texto:**
+   ```
+   +Ducz briga de gato
+   ```
+   O bot procura no MyInstants e toca o som que mais se assemelha! 🔍
+
+4. **Tocar áudio do YouTube:**
+   ```
+   +Ducz https://www.youtube.com/watch?v=dQw4w9WgXcQ
+   ```
+   O bot extrai o áudio do vídeo e toca no canal de voz! 🎬
 
 ---
 
