@@ -31,8 +31,9 @@ function getPlaylistVideos(url, maxVideos = 50) {
       '-j',
       '--no-warnings',
       '--playlist-end',
-      '--extractor-args', 'youtube:player_client=android',
       String(maxVideos),
+      '--extractor-args',
+      'youtube:player_client=android',
       url,
     ]);
     

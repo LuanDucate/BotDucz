@@ -19,13 +19,20 @@ async function extractMp3Url(pageUrl) {
 }
 
 /**
- * Busca um som no MyInstants por texto.
- * Retorna { title, pageUrl } ou { title, mp3Url } do primeiro resultado, ou null.
+ * Busca sons no MyInstants por texto.
+ * Retorna um array de resultados (cada item é { title, pageUrl } ou { title, mp3Url }).
  */
-async function searchMyInstants(query) {
+async function searchMyInstants(query, maxResults = 10) {
   const searchUrl = `https://www.myinstants.com/pt/search/?name=${encodeURIComponent(query)}`;
   console.log(`🔍 Buscando no MyInstants: ${searchUrl}`);
-  const html = await fetchUrl(searchUrl);
+
+  let html;
+  try {
+    html = await fetchUrl(searchUrl);
+  } catch (err) {
+    // Quando não há resultados, o site costuma retornar 404.
+    return [];
+  }
 
   const resultPattern = /href=["'](\/pt\/instant\/[\w\-]+\/)["'][^>]*>([^<]*)/gi;
   const results = [];
@@ -39,6 +46,7 @@ async function searchMyInstants(query) {
         title: title || instantPath.split('/').filter(Boolean).pop().replace(/-/g, ' '),
         pageUrl: `https://www.myinstants.com${instantPath}`,
       });
+      if (results.length >= maxResults) break;
     }
   }
 
@@ -58,13 +66,14 @@ async function searchMyInstants(query) {
         title: soundName,
         mp3Url: `https://www.myinstants.com${mp3Path}`,
       });
+      if (results.length >= maxResults) break;
     }
   }
 
-  if (results.length === 0) return null;
+  if (results.length === 0) return [];
 
   console.log(`✅ Encontrados ${results.length} resultado(s). Primeiro: "${results[0].title}"`);
-  return results[0];
+  return results;
 }
 
 module.exports = { extractMp3Url, searchMyInstants };
