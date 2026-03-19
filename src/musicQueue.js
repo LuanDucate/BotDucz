@@ -9,11 +9,18 @@ const {
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { resolveSoundCloudTrackDetails } = require('./youtube');
 
 // ============================================================
 // Estado por guild
 // ============================================================
 const guilds = new Map();
+let onSongChangedCallback = null;
+
+function setOnSongChangedCallback(cb) {
+  onSongChangedCallback = typeof cb === 'function' ? cb : null;
+}
 
 function getGuildData(guildId) {
   if (!guilds.has(guildId)) {
@@ -24,13 +31,27 @@ function getGuildData(guildId) {
       queue: [],
       currentSong: null,
       textChannel: null,
+      anchorMessageId: null,
+      anchorNowPlayingEnabled: true,
       musicPausedForSfx: false,
       nowPlayingMessage: null,
+      nowPlayingRenderPromise: null,
       nowPlayingSfxMessage: null,
       lastVoiceErrorAt: 0,
       effect: null, // currently applied effect (string key)
       effectIntensity: 5, // intensidade do efeito (1-10)
       currentSongOffsetSeconds: 0,
+      loop: false,
+      history: [],
+      sequenceCounter: 0,
+      currentSequence: 0,
+      sfxPlaybackToken: 0,
+      advanceInProgress: false,
+      advanceRequested: false,
+      suppressNextIdleCount: 0,
+      suppressNextErrorAdvanceCount: 0,
+      navCooldownUntil: 0,
+      externalMoveGraceUntil: 0,
     });
   }
   return guilds.get(guildId);
@@ -47,6 +68,47 @@ function killProcessSafe(proc) {
   try {
     proc.kill('SIGTERM');
   } catch {}
+}
+
+function buildMusicControlRow(guildId) {
+  const data = guilds.get(guildId);
+  const loopActive = data?.loop || false;
+  const hasPrevious = Array.isArray(data?.history) && data.history.length > 0;
+  const hasNext = Array.isArray(data?.queue) && data.queue.length > 0;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`music_prev_${guildId}`)
+      .setEmoji('⏮️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasPrevious),
+    new ButtonBuilder()
+      .setCustomId(`music_stop_${guildId}`)
+      .setEmoji('⏹️')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`music_skip_${guildId}`)
+      .setEmoji('⏭️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasNext),
+    new ButtonBuilder()
+      .setCustomId(`music_loop_${guildId}`)
+      .setEmoji('🔁')
+      .setStyle(loopActive ? ButtonStyle.Success : ButtonStyle.Secondary),
+  );
+}
+
+function isExpectedStreamCloseError(err) {
+  if (!err) return false;
+  const code = String(err.code || '').toUpperCase();
+  const msg = String(err.message || err || '').toLowerCase();
+  let raw = '';
+  try {
+    raw = JSON.stringify(err).toLowerCase();
+  } catch {}
+  if (code === 'EPIPE' || code === 'EOF' || code === 'ERR_STREAM_PREMATURE_CLOSE') return true;
+  if (msg.includes('premature close') || msg.includes('broken pipe') || msg.includes('eof')) return true;
+  if (raw.includes('premature close') || raw.includes('broken pipe') || raw.includes('err_stream_premature_close')) return true;
+  return false;
 }
 
 function destroyStreamSafe(stream) {
@@ -77,11 +139,110 @@ function cleanupOldStream(data, old) {
   }, 250);
 }
 
+function buildNowPlayingContent(song, queueSize, currentSequence = 0) {
+  const sequenceMsg = currentSequence > 0 ? ` | #${currentSequence}` : '';
+  const queueMsg = queueSize > 0 ? ` | ${queueSize} na fila` : '';
+  const linkRef = song?.url && song.url.startsWith('http') ? `\n🔗 ${song.url}` : '';
+  return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${linkRef}`;
+}
+
+async function upsertNowPlayingMessage(guildId, opts = {}) {
+  const data = guilds.get(guildId);
+  if (!data || !data.textChannel || !data.currentSong) return false;
+  const forceResend = Boolean(opts?.forceResend);
+
+  const payload = {
+    content: buildNowPlayingContent(data.currentSong, data.queue.length, data.currentSequence || 0),
+    components: [buildMusicControlRow(guildId)],
+  };
+
+  const previousRender = data.nowPlayingRenderPromise || Promise.resolve();
+  data.nowPlayingRenderPromise = previousRender
+    .catch(() => {})
+    .then(async () => {
+      if (!data.currentSong || !data.textChannel) return false;
+
+      if (data.nowPlayingMessage && !forceResend) {
+        const updated = await data.nowPlayingMessage.edit(payload).catch(() => null);
+        if (updated) {
+          data.nowPlayingMessage = updated;
+          return true;
+        }
+      }
+
+      if (data.nowPlayingMessage && forceResend) {
+        await data.nowPlayingMessage.delete().catch(() => {});
+        data.nowPlayingMessage = null;
+      }
+
+      const sendPayload = data.anchorMessageId && data.anchorNowPlayingEnabled !== false
+        ? {
+            ...payload,
+            reply: {
+              messageReference: data.anchorMessageId,
+              failIfNotExists: false,
+            },
+          }
+        : payload;
+
+      const created = await data.textChannel.send(sendPayload).catch(() => null);
+      if (created) {
+        data.nowPlayingMessage = created;
+        return true;
+      }
+
+      return false;
+    });
+
+  return data.nowPlayingRenderPromise;
+}
+
+async function refreshNowPlayingMessage(guildId, opts = {}) {
+  return upsertNowPlayingMessage(guildId, opts);
+}
+
+function isSoundCloudApiTrack(song) {
+  const url = String(song?.url || '').trim().toLowerCase();
+  return url.includes('api-v2.soundcloud.com/tracks/');
+}
+
+async function ensurePlayableSong(song) {
+  if (!song || !isSoundCloudApiTrack(song)) return song;
+
+  const resolved = await resolveSoundCloudTrackDetails(song.url).catch(() => null);
+  if (!resolved) return song;
+
+  song.url = resolved.url;
+  song.title = resolved.title;
+  song.needsResolve = false;
+  return song;
+}
+
 function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   const data = guilds.get(guildId);
   if (!data) return;
+  const previousSong = data.currentSong;
+
+  // Ensure history array exists and is properly typed
+  if (!Array.isArray(data.history)) {
+    data.history = [];
+  }
+
+  // Ao trocar de recurso com player ativo, o recurso antigo pode emitir Idle.
+  // Contabilizamos para ignorar esse Idle fantasma e não avançar duas vezes.
+  const playerStatus = data.musicPlayer?.state?.status;
+  const replacingActiveResource =
+    Boolean(data.currentSong) &&
+    playerStatus &&
+    playerStatus !== AudioPlayerStatus.Idle;
+  if (replacingActiveResource) {
+    data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
+    data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+  }
 
   data.currentSong = song;
+  data.currentSequence = Number.isFinite(song?.sequence) ? song.sequence : (data.currentSequence || 0);
+  const songChanged = previousSong !== song;
 
   console.log(
     `🎶 Tocando: ${song.title} (efeito: ${data.effect || 'nenhum'}, seek: ${seekSeconds}s)`
@@ -110,7 +271,7 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   // Evita crash por EPIPE quando mudamos de stream rapidamente.
   if (stream && typeof stream.on === 'function') {
     stream.on('error', (err) => {
-      if (err && (err.code === 'EPIPE' || err.code === 'EOF')) return;
+      if (isExpectedStreamCloseError(err)) return;
       console.error('❌ Erro no stream de áudio:', err?.message || err);
     });
   }
@@ -129,20 +290,13 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   data.musicPlayer.play(resource);
 
   if (data.textChannel) {
-    const queueSize = data.queue.length;
-    const queueMsg = queueSize > 0 ? ` | 📋 ${queueSize} na fila` : '';
-
-    if (data.nowPlayingMessage) {
-      data.nowPlayingMessage.delete().catch(() => {});
-      data.nowPlayingMessage = null;
+    if (songChanged && typeof onSongChangedCallback === 'function') {
+      Promise.resolve(onSongChangedCallback(guildId, song)).catch(() => {
+        upsertNowPlayingMessage(guildId, { forceResend: true }).catch(() => {});
+      });
+    } else {
+      upsertNowPlayingMessage(guildId, { forceResend: songChanged }).catch(() => {});
     }
-
-    data.textChannel
-      .send(`🎶 Tocando: **${song.title}**${queueMsg}`)
-      .then((msg) => {
-        data.nowPlayingMessage = msg;
-      })
-      .catch(() => {});
   }
 }
 
@@ -247,30 +401,7 @@ async function ensureConnection(message) {
       adapterCreator: message.guild.voiceAdapterCreator,
     });
 
-    // Evita crash quando a biblioteca emite erro de rede
-    const onConnectionError = (err) => {
-      const now = Date.now();
-      const isIpDiscoveryError =
-        err && typeof err.message === 'string' &&
-        err.message.includes('Cannot perform IP discovery');
-
-      // Se for erro comum de IP discovery, limita logs a cada 30s por guild
-      if (isIpDiscoveryError) {
-        if (now - data.lastVoiceErrorAt < 30_000) return;
-        data.lastVoiceErrorAt = now;
-      }
-
-      console.error('⚠️ Erro na conexão de voz:', err.message || err);
-    };
-    data.connection.on('error', onConnectionError);
-
-    // Remover listener ao destruir a conexão, para evitar múltiplos logs
-    const cleanupConnection = () => {
-      try {
-        data.connection?.removeListener('error', onConnectionError);
-      } catch {}
-    };
-    data.connection.on(VoiceConnectionStatus.Destroyed, cleanupConnection);
+    wireConnectionLifecycle(data, message.guildId);
 
     try {
       await entersState(data.connection, VoiceConnectionStatus.Ready, 30_000);
@@ -280,18 +411,6 @@ async function ensureConnection(message) {
       data.connection = null;
       throw new Error('VOICE_TIMEOUT');
     }
-
-    data.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(data.connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(data.connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-      } catch {
-        cleanup(message.guildId);
-      }
-    });
-
     // Resetar players ao reconectar
     data.musicPlayer = null;
     data.sfxPlayer = null;
@@ -302,23 +421,42 @@ async function ensureConnection(message) {
     data.musicPlayer = createAudioPlayer();
 
     data.musicPlayer.on(AudioPlayerStatus.Idle, () => {
-      console.log('🔇 Música finalizada.');
-
-      if (data.nowPlayingMessage) {
-        data.nowPlayingMessage.delete().catch(() => {});
-        data.nowPlayingMessage = null;
+      if ((data.suppressNextIdleCount || 0) > 0) {
+        data.suppressNextIdleCount -= 1;
+        return;
       }
+
+      console.log('🔇 Música finalizada.');
       if (data.nowPlayingSfxMessage) {
         data.nowPlayingSfxMessage.delete().catch(() => {});
         data.nowPlayingSfxMessage = null;
       }
 
+      const lastSong = data.currentSong;
       data.currentSong = null;
       data.currentSongOffsetSeconds = 0;
-      playNext(message.guildId);
+
+      if (data.loop && lastSong) {
+        // Loop ativo: repete a mesma música sem avançar a fila
+        playSong(message.guildId, lastSong);
+      } else {
+        // Histórico para o botão ⏮️ voltar (limitado para não crescer sem fim)
+        if (lastSong) {
+          if (!Array.isArray(data.history)) data.history = [];
+          data.history.push(lastSong);
+          if (data.history.length > 100) data.history.shift();
+        }
+        playNext(message.guildId);
+      }
     });
 
     data.musicPlayer.on('error', (error) => {
+      if ((data.suppressNextErrorAdvanceCount || 0) > 0) {
+        data.suppressNextErrorAdvanceCount -= 1;
+        console.warn('⚠️ Ignorando erro do recurso anterior durante troca manual.');
+        return;
+      }
+
       if (error && (error.code === 'EPIPE' || error.code === 'EOF')) {
         console.warn('⚠️ Erro de pipe/EOF no music player, avançando para próxima faixa.');
         cleanupCurrentStream(data);
@@ -342,6 +480,7 @@ async function ensureConnection(message) {
   }
 
   data.textChannel = message.channel;
+  if (message?.id) data.anchorMessageId = message.id;
   return data;
 }
 
@@ -623,6 +762,9 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
     const msg = d.toString().trim();
     if (!msg) return;
     if (msg.toLowerCase().includes('broken pipe')) return;
+    if (msg.toLowerCase().includes('invalid argument')) return;
+    if (msg.toLowerCase().includes('exception ignored in:')) return;
+    if (msg.toLowerCase().includes("textiowrapper name='<stdout>'")) return;
     console.error('yt-dlp stderr:', msg);
   };
 
@@ -633,7 +775,7 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
 
   if (ytdlp.stdout && typeof ytdlp.stdout.on === 'function') {
     ytdlp.stdout.on('error', (err) => {
-      if (err && err.code === 'EPIPE') return;
+      if (isExpectedStreamCloseError(err)) return;
       console.error('❌ yt-dlp stdout erro:', err?.message || err);
     });
   }
@@ -671,7 +813,7 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
 
   if (ffmpeg.stdout && typeof ffmpeg.stdout.on === 'function') {
     ffmpeg.stdout.on('error', (err) => {
-      if (err && err.code === 'EPIPE') return;
+      if (isExpectedStreamCloseError(err)) return;
       console.error('❌ ffmpeg stdout erro:', err?.message || err);
     });
   }
@@ -679,15 +821,46 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
   return { stream: ffmpeg.stdout, ytdlp, ffmpeg, isRaw: true };
 }
 
-function playNext(guildId) {
+async function playNext(guildId) {
   const data = guilds.get(guildId);
-  if (!data || data.queue.length === 0) {
-    if (data) data.currentSong = null;
+  if (!data) {
     return;
   }
 
-  const song = data.queue.shift();
-  playSong(guildId, song);
+  // Ensure history array exists
+  if (!Array.isArray(data.history)) {
+    data.history = [];
+  }
+
+  if (data.advanceInProgress) {
+    data.advanceRequested = true;
+    return;
+  }
+
+  data.advanceInProgress = true;
+  try {
+    if (data.queue.length === 0) {
+      data.currentSong = null;
+      if (data.nowPlayingMessage) {
+        data.nowPlayingMessage.delete().catch(() => {});
+        data.nowPlayingMessage = null;
+      }
+      if (typeof onSongChangedCallback === 'function') {
+        Promise.resolve(onSongChangedCallback(guildId, null)).catch(() => {});
+      }
+      return;
+    }
+
+    const song = data.queue.shift();
+    await ensurePlayableSong(song);
+    playSong(guildId, song);
+  } finally {
+    data.advanceInProgress = false;
+    if (data.advanceRequested) {
+      data.advanceRequested = false;
+      setTimeout(() => playNext(guildId), 0);
+    }
+  }
 }
 
 /**
@@ -696,11 +869,17 @@ function playNext(guildId) {
 async function addYouTube(message, url, title) {
   const data = await ensureConnection(message);
   const song = { url, title: title || 'vídeo do YouTube' };
+  if (!Number.isFinite(song.sequence)) {
+    data.sequenceCounter = (data.sequenceCounter || 0) + 1;
+    song.sequence = data.sequenceCounter;
+  }
 
+  // CRITICAL: isActive deve considerar Buffering também!
   const isActive =
     data.currentSong &&
     (data.musicPlayer.state.status === AudioPlayerStatus.Playing ||
-      data.musicPlayer.state.status === AudioPlayerStatus.Paused);
+      data.musicPlayer.state.status === AudioPlayerStatus.Paused ||
+      data.musicPlayer.state.status === AudioPlayerStatus.Buffering);
 
   if (!isActive) {
     data.queue.push(song);
@@ -709,32 +888,60 @@ async function addYouTube(message, url, title) {
     data.queue.push(song);
     const position = data.queue.length;
     message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`);
+    await refreshNowPlayingMessage(message.guildId).catch(() => {});
   }
 }
 
 /**
  * Adiciona todos os vídeos de uma playlist à fila.
+ * opts.editMsg  — mensagem existente a editar em vez de criar nova
+ * opts.statusText — texto customizado (substitui o padrão)
+ * Retorna a mensagem enviada/editada.
  */
-async function addPlaylist(message, videos) {
+async function addPlaylist(message, videos, opts = {}) {
   const data = await ensureConnection(message);
 
+  // CRITICAL: isActive deve considerar Buffering também, senão playNext() é chamado prematuramente!
   const isActive =
     data.currentSong &&
     (data.musicPlayer.state.status === AudioPlayerStatus.Playing ||
-      data.musicPlayer.state.status === AudioPlayerStatus.Paused);
+      data.musicPlayer.state.status === AudioPlayerStatus.Paused ||
+      data.musicPlayer.state.status === AudioPlayerStatus.Buffering);
 
   for (const video of videos) {
+    if (!Number.isFinite(video.sequence)) {
+      data.sequenceCounter = (data.sequenceCounter || 0) + 1;
+      video.sequence = data.sequenceCounter;
+    }
     data.queue.push(video);
   }
 
   if (!isActive) {
-    message.reply(
-      `📋 Playlist com **${videos.length}** música(s) adicionada! Tocando a primeira...`
-    );
     playNext(message.guildId);
-  } else {
-    message.reply(`📋 **${videos.length}** música(s) da playlist adicionadas à fila!`);
   }
+
+  const defaultText = !isActive
+    ? `📋 Playlist com **${videos.length}** música(s) adicionada! Tocando a primeira...`
+    : `📋 **${videos.length}** música(s) da playlist adicionadas à fila!`;
+
+  const text = Object.prototype.hasOwnProperty.call(opts, 'statusText') ? opts.statusText : defaultText;
+
+  if (opts.skipStatusMessage) {
+    await refreshNowPlayingMessage(message.guildId).catch(() => {});
+    return opts.editMsg || null;
+  }
+
+  let sentMsg = null;
+  if (opts.editMsg && typeof opts.editMsg.edit === 'function') {
+    sentMsg = await opts.editMsg.edit(text).catch(() => null);
+    if (!sentMsg) sentMsg = await message.reply(text).catch(() => null);
+  } else {
+    sentMsg = await message.reply(text).catch(() => null);
+  }
+
+  await refreshNowPlayingMessage(message.guildId).catch(() => {});
+
+  return sentMsg;
 }
 
 // ============================================================
@@ -748,6 +955,9 @@ async function addPlaylist(message, videos) {
  */
 async function playSfx(message, tmpFile, displayName) {
   const data = await ensureConnection(message);
+  const requesterId = message.author?.id || '0';
+  const sfxToken = (data.sfxPlaybackToken || 0) + 1;
+  data.sfxPlaybackToken = sfxToken;
 
   const musicIsPlaying =
     data.musicPlayer.state.status === AudioPlayerStatus.Playing;
@@ -770,18 +980,33 @@ async function playSfx(message, tmpFile, displayName) {
     data.nowPlayingSfxMessage = null;
   }
 
+  const sfxControls = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sfx_stop_${message.guildId}_${requesterId}`)
+      .setEmoji('⏹️')
+      .setStyle(ButtonStyle.Danger)
+  );
+
   const msg = await message
-    .reply(`🔊 Tocando: **${displayName || 'som'}**`)
+    .reply({
+      content: `🔊 Tocando: **${displayName || 'som'}**`,
+      components: [sfxControls],
+    })
     .catch(() => null);
 
-  if (msg) {
+  if (msg && data.sfxPlaybackToken === sfxToken) {
     data.nowPlayingSfxMessage = msg;
+  } else if (msg) {
+    msg.delete().catch(() => {});
   }
 
   // Quando o SFX terminar, retomar a música
   const onFinish = () => {
     data.sfxPlayer.removeListener('error', onError);
     fs.unlink(tmpFile, () => {});
+
+    // Ignore finalização de um SFX antigo quando já existe outro mais novo tocando.
+    if (data.sfxPlaybackToken !== sfxToken) return;
 
     if (data.nowPlayingSfxMessage) {
       data.nowPlayingSfxMessage.delete().catch(() => {});
@@ -802,6 +1027,14 @@ async function playSfx(message, tmpFile, displayName) {
     data.sfxPlayer.removeListener(AudioPlayerStatus.Idle, onFinish);
     fs.unlink(tmpFile, () => {});
 
+    // Ignore erro de um SFX antigo quando já existe outro mais novo tocando.
+    if (data.sfxPlaybackToken !== sfxToken) return;
+
+    if (data.nowPlayingSfxMessage) {
+      data.nowPlayingSfxMessage.delete().catch(() => {});
+      data.nowPlayingSfxMessage = null;
+    }
+
     if (data.musicPausedForSfx) {
       data.connection.subscribe(data.musicPlayer);
       data.musicPlayer.unpause();
@@ -815,6 +1048,17 @@ async function playSfx(message, tmpFile, displayName) {
   return msg;
 }
 
+function stopSfx(guildId) {
+  const data = guilds.get(guildId);
+  if (!data || !data.sfxPlayer) return false;
+
+  const status = data.sfxPlayer.state?.status;
+  if (!status || status === AudioPlayerStatus.Idle) return false;
+
+  data.sfxPlayer.stop();
+  return true;
+}
+
 // ============================================================
 // Comandos de controle
 // ============================================================
@@ -826,9 +1070,41 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
     return;
   }
 
+  const now = Date.now();
+  if (now < (data.navCooldownUntil || 0)) {
+    await replyFn('⏳ Aguarde um instante antes de avançar novamente.');
+    return;
+  }
+  data.navCooldownUntil = now + 350;
+
+  if (data.queue.length === 0) {
+    await replyFn('❌ Não há próxima música na fila.');
+    return;
+  }
+
+  // Add current song to history before advancing
+  if (!Array.isArray(data.history)) data.history = [];
   const skipped = data.currentSong.title;
-  // stop() dispara o evento Idle → playNext() toca a próxima
-  data.musicPlayer.stop();
+  if (data.currentSong) {
+    data.history.push(data.currentSong);
+    if (data.history.length > 100) data.history.shift();
+  }
+
+  // Get next song WITHOUT revealing it yet
+  const nextSong = data.queue.shift();
+
+  // Immediately suppress Idle/error from old resource during the manual switch
+  data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
+  data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+
+  // Ensure SoundCloud metadata is fresh
+  await ensurePlayableSong(nextSong).catch(() => {});
+  
+  // Play the next song (will increment suppress counters again if active resource exists)
+  playSong(message.guildId, nextSong, 0, true);
+  
+  // Update UI and notify
+  await refreshNowPlayingMessage(message.guildId).catch(() => {});
   await replyFn(`⏭️ Pulando: **${skipped}**`);
 }
 
@@ -851,7 +1127,15 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
 
   data.queue = [];
   data.currentSong = null;
+  data.currentSequence = 0;
+  data.sequenceCounter = 0;
+  data.history = [];
   data.musicPausedForSfx = false;
+  data.advanceInProgress = false;
+  data.advanceRequested = false;
+  data.suppressNextIdleCount = 0;
+  data.suppressNextErrorAdvanceCount = 0;
+  data.navCooldownUntil = 0;
   if (data.musicPlayer) data.musicPlayer.stop();
   if (data.sfxPlayer) data.sfxPlayer.stop();
   await replyFn('⏹️ Áudio parado e fila limpa!');
@@ -877,6 +1161,64 @@ function leave(message) {
   message.reply('👋 Saí do canal de voz!');
 }
 
+function leaveSilently(guildId) {
+  const data = guilds.get(guildId);
+  if (!data || !data.connection) return false;
+  cleanup(guildId);
+  return true;
+}
+
+function wireConnectionLifecycle(data, guildId) {
+  if (!data?.connection) return;
+  const boundConnection = data.connection;
+
+  // Evita crash quando a biblioteca emite erro de rede
+  const onConnectionError = (err) => {
+    if (data.connection !== boundConnection) return;
+
+    const now = Date.now();
+    const isIpDiscoveryError =
+      err && typeof err.message === 'string' &&
+      err.message.includes('Cannot perform IP discovery');
+
+    // Se for erro comum de IP discovery, limita logs a cada 30s por guild
+    if (isIpDiscoveryError) {
+      if (now - data.lastVoiceErrorAt < 30_000) return;
+      data.lastVoiceErrorAt = now;
+    }
+
+    console.error('⚠️ Erro na conexão de voz:', err.message || err);
+  };
+
+  data.connection.on('error', onConnectionError);
+
+  // Remover listener ao destruir a conexão, para evitar múltiplos logs
+  const cleanupConnection = () => {
+    if (data.connection !== boundConnection) return;
+    try {
+      boundConnection.removeListener('error', onConnectionError);
+    } catch {}
+  };
+  boundConnection.on(VoiceConnectionStatus.Destroyed, cleanupConnection);
+
+  boundConnection.on(VoiceConnectionStatus.Disconnected, async () => {
+    if (data.connection !== boundConnection) return;
+
+    try {
+      await Promise.race([
+        entersState(boundConnection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(boundConnection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      if (data.connection !== boundConnection) return;
+      if (Date.now() < (data.externalMoveGraceUntil || 0)) {
+        return;
+      }
+      cleanup(guildId);
+    }
+  });
+}
+
 function cleanup(guildId) {
   const data = guilds.get(guildId);
   if (!data) return;
@@ -892,7 +1234,15 @@ function cleanup(guildId) {
 
   data.queue = [];
   data.currentSong = null;
+  data.anchorMessageId = null;
+  data.anchorNowPlayingEnabled = true;
+  data.history = [];
   data.musicPausedForSfx = false;
+  data.advanceInProgress = false;
+  data.advanceRequested = false;
+  data.suppressNextIdleCount = 0;
+  data.suppressNextErrorAdvanceCount = 0;
+  data.navCooldownUntil = 0;
   if (data.musicPlayer) data.musicPlayer.stop();
   if (data.sfxPlayer) data.sfxPlayer.stop();
   if (data.connection) {
@@ -913,7 +1263,7 @@ function getQueue(guildId) {
   };
 }
 
-function jumpTo(guildId, position) {
+async function jumpTo(guildId, position) {
   const data = guilds.get(guildId);
   if (!data) return false;
 
@@ -921,17 +1271,72 @@ function jumpTo(guildId, position) {
   const idx = Math.floor(position) - 1;
   if (isNaN(idx) || idx < 0 || idx >= data.queue.length) return false;
 
-  // Remove items before the desired one
-  data.queue.splice(0, idx);
+  if (!Array.isArray(data.history)) data.history = [];
 
-  // Stop current song to trigger playNext()
-  if (data.musicPlayer) {
-    data.musicPlayer.stop();
-  } else {
-    playNext(guildId);
-  }
+  // Keep skipped songs in history so ⏮️ can walk back from the jumped target.
+  const skippedBeforeTarget = data.queue.splice(0, idx);
+  const targetSong = data.queue.shift();
+  if (!targetSong) return false;
+
+  if (data.currentSong) data.history.push(data.currentSong);
+  if (skippedBeforeTarget.length > 0) data.history.push(...skippedBeforeTarget);
+  while (data.history.length > 100) data.history.shift();
+
+  data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
+  data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+
+  await ensurePlayableSong(targetSong).catch(() => {});
+  playSong(guildId, targetSong, 0, true);
+  await refreshNowPlayingMessage(guildId).catch(() => {});
 
   return true;
+}
+
+function toggleLoop(guildId) {
+  const data = guilds.get(guildId);
+  if (!data) return false;
+  data.loop = !data.loop;
+  return data.loop;
+}
+
+function getLoop(guildId) {
+  const data = guilds.get(guildId);
+  return data?.loop || false;
+}
+
+/**
+ * Toca a música anterior (botão ⏮️).
+ * Empurra a música atual para o início da fila e inicia a anterior imediatamente.
+ * Retorna false se não há música anterior.
+ */
+function playPrevious(message) {
+  const data = guilds.get(message.guildId);
+  if (!data || !Array.isArray(data.history) || data.history.length === 0) return false;
+
+  const now = Date.now();
+  if (now < (data.navCooldownUntil || 0)) return false;
+  data.navCooldownUntil = now + 350;
+
+  const prev = data.history.pop();
+  const curr = data.currentSong;
+
+  // Preserva a música atual no início da fila para permitir voltar/avançar sem saltos.
+  if (curr) data.queue.unshift(curr);
+
+  // Toca a anterior imediatamente.
+  playSong(message.guildId, prev, 0, true);
+  refreshNowPlayingMessage(message.guildId).catch(() => {});
+  return true;
+}
+
+function getNowPlayingMessageId(guildId) {
+  const data = guilds.get(guildId);
+  return data?.nowPlayingMessage?.id || null;
+}
+
+function setNowPlayingAnchorEnabled(guildId, enabled) {
+  const data = getGuildData(guildId);
+  data.anchorNowPlayingEnabled = Boolean(enabled);
 }
 
 module.exports = {
@@ -953,4 +1358,14 @@ module.exports = {
   setEffectIntensity,
   getEffectIntensity,
   applyEffectNow,
+  toggleLoop,
+  getLoop,
+  playPrevious,
+  buildMusicControlRow,
+  refreshNowPlayingMessage,
+  getNowPlayingMessageId,
+  setNowPlayingAnchorEnabled,
+  setOnSongChangedCallback,
+  leaveSilently,
+  stopSfx,
 };

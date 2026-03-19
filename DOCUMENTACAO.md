@@ -1,90 +1,189 @@
-# 📖 Documentação Técnica — BotDucz
+# Documentacao Tecnica - BotDucz
 
-## Visão Geral
+## 1. Objetivo
 
-O **BotDucz** é um bot para Discord que reproduz áudios do site [MyInstants](https://www.myinstants.com) e do **YouTube** diretamente em canais de voz. Os usuários podem:
-- Enviar um **link do MyInstants** para tocar o som
-- **Buscar por texto** (ex: `+Ducz monark`) e o bot encontra e toca o som mais relevante
-- Enviar um **link do YouTube** para tocar o áudio do vídeo
+O BotDucz e um bot de audio para Discord focado em:
+- MyInstants (SFX por busca/link)
+- YouTube (busca/link/playlist)
+- SoundCloud (link/playlist)
+- Spotify (track/playlist/album/artista convertido para YouTube)
 
-## Arquitetura
+Tambem inclui:
+- fila com navegacao por botao
+- efeitos com intensidade
+- favoritos compartilhados para pesquisa de instant
+- comandos por prefixo e slash commands
 
-```
-Usuário envia mensagem → Bot recebe a mensagem
-        ↓
-Verifica se tem o prefixo "+Ducz"
-        ↓
-Identifica o tipo de input:
-        ↓
-┌─ Comandos (ajuda / parar / sair)
-│
-├─ Link do MyInstants:
-│   1. Faz requisição HTTP para a página
-│   2. Extrai a URL do MP3 via scraping do HTML
-│   3. Baixa o MP3 temporariamente
-│   4. Conecta ao canal de voz e reproduz
-│
-├─ Link do YouTube:
-│   1. Usa play-dl para obter stream de áudio
-│   2. Conecta ao canal de voz e reproduz
-│
-└─ Texto (busca):
-    1. Faz scraping da busca do MyInstants
-    2. Pega o primeiro resultado
-    3. Extrai o MP3 e reproduz
-```
+## 2. Stack e dependencias
 
-## Tecnologias
+- Node.js 18+
+- discord.js v14
+- @discordjs/voice
+- ffmpeg-static
+- yt-dlp (via processo externo)
+- opusscript
+- dotenv
 
-| Tecnologia | Versão | Uso |
-|---|---|---|
-| Node.js | 18+ | Runtime JavaScript |
-| discord.js | v14 | Comunicação com a API do Discord |
-| @discordjs/voice | v0.19 | Conexão e reprodução em canais de voz |
-| play-dl | v1.9 | Stream de áudio do YouTube |
-| ffmpeg-static | v5 | FFmpeg bundled para processamento de áudio |
-| opusscript | v0.1 | Codificação de áudio Opus |
-| dotenv | v16 | Gerenciamento de variáveis de ambiente |
+## 3. Fluxo geral de comandos
 
-## Como Funciona
+1. Usuario envia comando (prefixo ou slash)
+2. index.js identifica tipo de comando
+3. Roteia para:
+- handleInstantsQuery (MyInstants)
+- handlePlayQuery (YouTube/SoundCloud/Spotify)
+- comandos de fila, efeitos, prefixo, limpeza, ajuda
+4. src/musicQueue.js gerencia estado por guild:
+- conexao de voz
+- players
+- fila e musica atual
+- efeito/intensidade
+- mensagens de now playing
 
-### 1. Extração do MP3 (MyInstants)
+## 4. Comandos por categoria
 
-O bot faz uma requisição HTTP GET para a página do MyInstants (ex: `https://www.myinstants.com/pt/instant/briga-de-gato-25101/`), recebe o HTML e busca pela URL do MP3 usando expressões regulares. Os padrões buscados são:
+### 4.1 Prefixo - reproducao
 
-1. **Link de download**: `href="/media/sounds/nome.mp3"`
-2. **Botão de play**: `play('/media/sounds/nome.mp3')`
-3. **Referência genérica**: qualquer ocorrência de `/media/sounds/*.mp3`
+- +i <texto|link-myinstants>
+- +d <texto|link>
+- +play <texto|link>
 
-### 2. Busca por Texto (MyInstants)
+### 4.2 Prefixo - fila/controle
 
-Quando o usuário digita texto em vez de um link, o bot:
-1. Faz GET em `https://www.myinstants.com/pt/search/?name=<query>`
-2. Faz scraping do HTML para encontrar links de instants nos resultados
-3. Pega o primeiro resultado e extrai o MP3 da página correspondente
+- +fila
+- +fila <n>
+- +skip
+- +stop
+- +d sair
 
-### 3. Stream do YouTube
+### 4.3 Prefixo - efeitos
 
-Quando o usuário envia um link do YouTube, o bot:
-1. Usa a biblioteca `play-dl` para obter o stream de áudio
-2. Cria um `AudioResource` diretamente do stream (sem baixar arquivo)
-3. Obtém o título do vídeo para exibir ao usuário
+- +efeito <nome> [1-10]
+- +ef <nome> [1-10]
+- +ef
+- +ef status
+- +ef off
+- +ef lista
 
-### 4. Reprodução de Áudio
+### 4.4 Prefixo - favoritos
 
-A função `connectToVoice()` gerencia a conexão com o canal de voz de forma reutilizável:
-1. Verifica se o usuário está em um canal de voz
-2. Conecta ao canal usando `joinVoiceChannel()`
-3. Cria um `AudioPlayer` e subscreve na conexão
+- Lista compartilhada por todos no servidor
+- +fav
+- +fav <numero>
+- +fav remove <numero>
 
-### 5. Gerenciamento de Estado
+### 4.5 Prefixo - utilitarios
 
-O bot mantém um `Map` (`guildPlayers`) que armazena o player e a conexão de voz ativa por servidor (guild). Isso permite controlar a reprodução (parar) e a conexão (sair) por servidor independentemente.
+- +help
+- +d ajuda
+- +d prefix [add|remove|reset]
+- +clear <1m|2h|1d>
+- +killbot (owner)
 
-### 4. Intents do Discord
+### 4.6 Slash commands (/)
 
-O bot utiliza as seguintes intents:
-- `Guilds` — informações sobre servidores
-- `GuildMessages` — receber mensagens
-- `GuildVoiceStates` — informações sobre canais de voz
-- `MessageContent` — ler o conteúdo das mensagens (requer ativação no Portal do Discord)
+- /play query:<texto|link>
+- /instants query:<texto|link-myinstants>
+- /queue [posicao]
+- /skip
+- /stop
+- /effect acao:<ativar|off|status|lista> [nome] [intensidade]
+- /prefix acao:<view|add|remove|reset> [valor]
+- /leave
+- /help
+- /killbot
+
+## 5. Ajuda no Discord
+
+Painel de ajuda:
+- +help
+- /help
+
+Comportamento:
+- painel de ajuda com embed atualizado
+- botao "Fechar" para remover a mensagem de ajuda
+- qualquer usuario pode interagir e fechar
+
+## 6. Presenca e resumo operacional (bio visivel)
+
+Quando nao ha musica tocando, o bot alterna linhas de presenca com:
+- fontes suportadas (MyInstants/YouTube/SoundCloud/Spotify)
+- recursos (fila, +ef, favoritos)
+- creditos (Luam Ducate e Bryan Christen)
+
+Quando ha musica tocando:
+- presenca exibe titulo atual + "| +help"
+
+## 7. Perfil/Biografia do bot
+
+Importante:
+- a bio oficial do bot no perfil e configurada no Discord Developer Portal
+- essa bio nao e alterada pela API do bot em runtime
+
+Texto recomendado:
+"Reproduz audios do MyInstants, YouTube, SoundCloud e Spotify, com fila, efeitos e favoritos. Criado por Luam Ducate (github/luanducate), com colaboracao de Bryan Christen (github/bryan-christen)."
+
+## 8. Arquivos principais
+
+- index.js: parsing de comando, help, slash, interacoes, presenca
+- src/musicQueue.js: fila, tocador, efeitos, now playing, botoes de controle
+- src/myinstants.js: scraping de busca e extracao de mp3
+- src/youtube.js: resolucao de midia YouTube e utilitarios de busca
+- src/soundcloud.js: interface de funcoes SoundCloud
+- src/spotify.js: funcoes de extracao/normalizacao para Spotify
+- src/utils.js: download/fetch utilitarios
+- favorites.json: armazenamento de favoritos compartilhados
+
+## 9. Historico de modificacoes (organizado por data)
+
+### v2.0.0 — 2026-03-19 (release atual)
+
+Release que consolida a evolucao completa do bot:
+- SoundCloud: faixas e playlists via yt-dlp streaming
+- Spotify: track, playlist, album e artista (resolucao para YouTube)
+- Fila paginada com botoes, modal "Tocar (#)" e refresh automatico
+- Controles inline de musica (botoes: anterior, parar, pular, loop)
+- Efeitos (+ef) com botao descartar e alias completo
+- Favoritos compartilhados (lista unica por servidor, migracao automatica)
+- Help com botao "Fechar" e embed atualizado
+- Slash /instants, /help, /queue e demais organizados
+- Presenca rotativa ociosa com creditos
+- Auto-leave configuravel via AUTO_LEAVE_MINUTES
+- Interacoes abertas: qualquer usuario pode usar botoes/modais
+- Modularizacao: src/spotify.js e src/soundcloud.js extraidos de index.js
+
+### 2026-03-19
+
+Topico A - Ajuda e UX:
+- +help e /help com botao "Fechar"
+- embed de help revisado e ampliado
+- informacoes de +ef reforcadas no help e respostas do comando
+
+Topico B - Slash e organizacao:
+- adicao de /instants
+- reorganizacao da listagem de slash commands
+
+Topico C - Presenca e resumo:
+- resumo rotativo em presenca ociosa
+- creditos de autoria e colaboracao adicionados
+
+Topico D - Documentacao:
+- README refeito com manual pratico
+- DOCUMENTACAO.md revisado por topicos
+
+Topico E - Refatoracao de estrutura:
+- remocao de restricao de usuario para botoes de interacao
+- extracao de helpers Spotify para src/spotify.js
+- extracao de helpers SoundCloud para src/soundcloud.js
+
+### v1.0.0 — versao inicial (sem data consolidada)
+
+- reproducao basica de MyInstants e YouTube
+- playlists YouTube/SoundCloud/Spotify
+- efeitos com intensidade
+- favoritos por usuario (migrado para compartilhado na v2.0.0)
+- auto-leave em canal vazio
+
+## 10. Creditos
+
+- Criado por Luam Ducate - github/luanducate
+- Colaboracao principal: Bryan Christen - github/bryan-christen

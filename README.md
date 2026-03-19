@@ -1,161 +1,194 @@
 # BotDucz
 
-Um bot para Discord que reproduz áudios do site [MyInstants](https://www.myinstants.com) e do **YouTube** diretamente em canais de voz.
+Bot de Discord para reproduzir audio em canal de voz com suporte a:
+- MyInstants (link ou busca por texto)
+- YouTube (link, busca e playlist)
+- SoundCloud (link e playlist)
+- Spotify (track, playlist, album e artista, convertido para YouTube)
 
-## Funcionalidades
+## Resumo rapido do que o bot faz
 
-- **Reprodução de áudios do MyInstants**: Envie um link direto ou busque por texto (ex: `+Ducz briga de gato`) para tocar o som mais relevante.
-- **Reprodução de áudios do YouTube**: Envie um link do YouTube para tocar o áudio do vídeo.
-- **Comandos básicos**: `+Ducz ajuda`, `+Ducz parar`, `+Ducz sair`.
-- **Gerenciamento de fila**: Suporte para fila de músicas (veja `src/musicQueue.js`).
+- Toca instant de MyInstants com comando rapido (+i)
+- Toca musicas por busca ou link (+d, +play)
+- Mantem fila de reproducao com navegacao por botoes
+- Permite pular, parar, sair e ir para item especifico da fila
+- Aplica efeitos de audio com intensidade (+efeito e +ef)
+- Suporta favoritos compartilhados para buscas do +i (+fav)
+- Tem comandos slash organizados no menu /
 
-# 🎵 Como Usar o BotDucz
+## Estrutura de codigo (didatica)
 
-## Pré-requisitos
+- index.js: roteamento principal de comandos e eventos do Discord
+- src/musicQueue.js: fila, players, efeitos, controle de reproducao
+- src/myinstants.js: busca e extracao de audio do MyInstants
+- src/youtube.js: funcoes de YouTube e utilitarios de busca via yt-dlp
+- src/soundcloud.js: ponto unico para funcoes SoundCloud
+- src/spotify.js: ponto unico para funcoes Spotify
+- src/utils.js: utilitarios HTTP/download
 
-1. **Node.js** versão 18 ou superior — [Baixar aqui](https://nodejs.org/)
-2. **FFmpeg** — necessário para processamento de áudio
+## Biografia sugerida do bot (Discord)
 
-### Instalar o FFmpeg no Windows
+Use este texto no perfil do bot no Discord Developer Portal:
 
-Opção 1 — Via **winget** (mais fácil):
-```bash
-winget install Gyan.FFmpeg
-```
+"Reproduz audios do MyInstants, YouTube, SoundCloud e Spotify, com fila, efeitos e favoritos. Criado por Luam Ducate (github/luanducate), com colaboracao de Bryan Christen (github/bryan-christen)."
 
-Opção 2 — Via **Chocolatey**:
-```bash
-choco install ffmpeg
-```
+Observacao: a bio de perfil do bot e configurada no Portal do Discord, nao pelo codigo.
 
-Opção 3 — Manual:
-1. Baixe em https://ffmpeg.org/download.html
-2. Extraia e adicione a pasta `bin` ao PATH do sistema
+## Instalacao
 
-> **Verifique a instalação:** abra o terminal e digite `ffmpeg -version`
-
----
-
-## Configurar o Bot no Discord
-
-### 1. Criar o Bot
-
-1. Acesse o [Discord Developer Portal](https://discord.com/developers/applications)
-2. Clique em **"New Application"** e dê o nome **BotDucz**
-3. No menu lateral, vá em **"Bot"**
-4. Clique em **"Reset Token"** e **copie o token** (guarde em local seguro!)
-
-### 2. Ativar Intents
-
-Na mesma página do Bot, ative estas opções:
-- ✅ **MESSAGE CONTENT INTENT**
-- ✅ **SERVER MEMBERS INTENT** (opcional)
-- ✅ **PRESENCE INTENT** (opcional)
-
-### 3. Definir Permissões e Convidar
-
-1. No menu lateral, vá em **"OAuth2" → "URL Generator"**
-2. Em **Scopes**, marque: `bot`
-3. Em **Bot Permissions**, marque:
-   - ✅ Send Messages
-   - ✅ Read Message History
-   - ✅ Add Reactions
-   - ✅ Connect
-   - ✅ Speak
-4. Copie a URL gerada e abra no navegador para **adicionar o bot ao seu servidor**
-
----
-
-## Instalar e Rodar
-
-### 1. Instalar dependências
+1. Instale dependencias:
 
 ```bash
-cd D:\PastaDoProjeto\BotDucz
 npm install
 ```
 
-### 2. Configurar o token
+2. Crie o arquivo .env a partir do .env.example e configure:
 
-Copie o arquivo `.env.example` para `.env` e coloque seu token:
-
-```bash
-copy .env.example .env
-```
-
-Edite o arquivo `.env`:
-```
+```env
 DISCORD_TOKEN=seu_token_aqui
+AUTO_LEAVE_MINUTES=2
 ```
 
-### 3. Iniciar o bot
+3. Inicie:
 
 ```bash
 npm start
 ```
 
-Você verá no terminal:
-```
-✅ BotDucz está online como BotDucz#1234
-📡 Conectado a 1 servidor(es)
-```
+## Prefixos principais
 
----
+- +d
+- +Ducz
+- +play
+- +i
+- +fav
+- +fila
+- +ef
+- +help
 
-## Comandos
+## Comandos por prefixo
 
-| Comando | Descrição |
-|---|---|
-| `+Ducz <link-myinstants>` | Toca o áudio do MyInstants no canal de voz |
-| `+Ducz <descrição>` | Busca um som no MyInstants por texto e toca o primeiro resultado |
-| `+Ducz <link-youtube>` | Toca o áudio de um vídeo do YouTube |
-| `+Ducz yt Link Park forró` | Toca o áudio do primeiro vídeo do YouTube com a descrição |
-| `+Ducz parar` | Para o áudio que está tocando |
-| `+Ducz sair` | Desconecta o bot do canal de voz |
-| `+Ducz ajuda` | Mostra a lista de comandos |
-| `+d`| Funciona igual ao +Ducz fica mais facil para digitar |
-|---|---|
+### Reproducao
 
+- +i <texto|link-myinstants>
+- +d <texto|link-youtube|link-soundcloud|link-spotify>
+- +play <texto|link-youtube|link-soundcloud|link-spotify>
 
-### Exemplos
+### Controle de fila
 
-1. Entre em um canal de voz no Discord
+- +d skip
+- +skip
+- +d parar
+- +stop
+- +d sair
+- +fila
+- +fila <numero>
 
-2. **Tocar um som do MyInstants por link:**
-   ```
-   +Ducz https://www.myinstants.com/pt/instant/briga-de-gato-25101/
-   ```
+### Efeitos
 
-3. **Buscar e tocar um som por texto:**
-   ```
-   +Ducz monark
-   ```
-   O bot procura no MyInstants e toca o som que mais se assemelha! 🔍
+- +efeito <nome> [1-10]
+- +ef <nome> [1-10]
+- +ef
+- +ef <1-10>
+- +ef status
+- +ef off
+- +ef lista
 
-4. **Tocar áudio do YouTube:**
-   ```
-   +Ducz https://www.youtube.com/watch?v=dQw4w9WgXcQ
-   ```
-   O bot extrai o áudio do vídeo e toca no canal de voz! 🎬
+### Favoritos de instant
 
----
+- Lista compartilhada por todos no servidor
+- +fav
+- +fav <numero>
+- +fav remove <numero>
 
-## Solução de Problemas
+### Utilitarios
 
-| Problema | Solução |
-|---|---|
-| Bot não responde | Verifique se o **MESSAGE CONTENT INTENT** está ativado no Portal |
-| "DISCORD_TOKEN não encontrado" | Verifique se o arquivo `.env` existe e contém o token |
-| Erro ao conectar no canal de voz | Verifique se o FFmpeg está instalado (`ffmpeg -version`) |
-| "Não tenho permissão" | Verifique as permissões do bot no servidor (Connect + Speak) |
-| Bot entra mas não toca áudio | Reinstale as dependências: `npm install @discordjs/opus sodium-native` |
+- +help
+- +d ajuda
+- +d prefix
+- +d prefix add <valor>
+- +d prefix remove <valor>
+- +d prefix reset
+- +clear <1m|2h|1d>
+- +killbot (apenas dono)
 
-## Contribuição
+## Slash commands (/)
 
-Sinta-se à vontade para abrir issues ou pull requests.
+- /play query:<texto|link>
+- /instants query:<texto|link-myinstants>
+- /queue [posicao]
+- /skip
+- /stop
+- /effect acao:<ativar|off|status|lista> [nome] [intensidade]
+- /prefix acao:<view|add|remove|reset> [valor]
+- /leave
+- /help
+- /killbot
 
-## Licença
+## Ajuda in-app
 
-Este projeto é de código aberto.
+- +help abre painel de ajuda com botao "Fechar"
+- /help abre o mesmo painel com botao "Fechar"
+- +fila possui botao de descarte e paginação
+- qualquer pessoa do canal pode interagir com os botoes de help/fila/efeitos
 
-## Luan Ducate 2026
+## Historico de modificacoes
+
+### v2.0.0 — 2026-03-19 (release atual)
+
+Versao principal que transforma o bot de um reprodutor basico (MyInstants + YouTube)
+numa plataforma completa de audio para Discord:
+
+- Suporte a SoundCloud (faixas e playlists)
+- Suporte a Spotify (track, playlist, album, artista)
+- Fila de reproducao com botoes de navegacao, paginacao e "Tocar (#)"
+- Controles de musica inline: ⏮️ anterior, ⏹️ parar, ⏭️ pular, 🔁 loop
+- Efeitos de audio com intensidade (+ef / +efeito) e botao descartar
+- Favoritos compartilhados para +i (lista unica do servidor)
+- Help com botao "Fechar" (+help e /help)
+- Slash command /instants dedicado ao MyInstants
+- Presenca rotativa com bio do bot e creditos
+- Auto-leave quando canal de voz fica vazio
+- Qualquer usuario pode interagir com botoes (sem restricao de autor)
+- Modularizacao: src/spotify.js e src/soundcloud.js
+- Scripts de manutencao no package.json (dev, check, start:verbose)
+- .gitignore expandido para commit limpo
+
+### 2026-03-19 - Organizacao de ajuda, docs e slash
+
+Etapa 1 - Ajuda/manual:
+- painel de help revisado com comandos atualizados
+- inclusao explicita do alias +ef em exemplos e orientacoes
+- inclusao de botao "Fechar" no +help e /help
+
+Etapa 2 - Slash commands:
+- reorganizacao da listagem do menu /
+- adicao do comando /instants para MyInstants direto
+- textos de descricao ajustados para facilitar uso
+
+Etapa 3 - Presenca/bio operacional:
+- presenca rotativa quando o bot esta ocioso com resumo de funcionalidades
+- linha de creditos em presenca: Luam Ducate e Bryan Christen
+
+Etapa 4 - Documentacao:
+- README reestruturado com guia pratico
+- comandos separados por topicos
+- secao de bio sugerida para o perfil do bot
+
+Etapa 5 - Organizacao de codigo:
+- criacao de src/spotify.js para centralizar funcoes de Spotify
+- criacao de src/soundcloud.js para centralizar funcoes de SoundCloud
+- index.js ficou mais limpo, mantendo o comportamento atual
+
+### v1.0.0 — versao inicial (sem data consolidada)
+
+- reproducao basica de MyInstants e YouTube
+- suporte a playlists YouTube/SoundCloud/Spotify
+- sistema de efeitos com intensidade
+- favoritos por usuario para +i (migrado para compartilhado na v2.0.0)
+- auto-leave quando canal de voz fica vazio
+
+## Creditos
+
+- Criado por Luam Ducate - github/luanducate
+- Colaboracao principal: Bryan Christen - github/bryan-christen
