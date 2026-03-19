@@ -28,3 +28,6 @@ coverage/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Notas e guias pessoais (só locais, não sobem pro GitHub)
+GUIA_GIT_PESSOAL.md

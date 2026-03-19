@@ -1,0 +1,23 @@
+{
+  "resolution": {
+    "maxItems": 15,
+    "concurrency": 3
+  },
+  "youtube": {
+    "playlistMaxVideos": 30,
+    "artistSearchResults": 10
+  },
+  "spotify": {
+    "collectionMaxTracks": 150,
+    "initialBatchSize": 1,
+    "batchSize": 8,
+    "initialResolveConcurrency": 1,
+    "batchResolveConcurrency": 6
+  },
+  "soundcloud": {
+    "resolveConcurrency": 1,
+    "firstBatchSize": 1,
+    "batchSize": 3,
+    "finalStatusDeleteDelayMs": 7000
+  }
+}

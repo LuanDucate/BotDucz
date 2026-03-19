@@ -1,0 +1,42 @@
+{
+  "presence": {
+    "idleText": "+help",
+    "playingSuffix": "| +help",
+    "maxActivityLength": 128,
+    "status": "online"
+  },
+  "autoLeave": {
+    "defaultMinutes": 2
+  },
+  "ui": {
+    "dismissTimeoutMs": 240000,
+    "queueRefreshIntervalMs": 7000,
+    "queuePageSize": 6,
+    "favoritesPreviewLimit": 15,
+    "myInstantsSuggestionButtons": 3,
+    "myInstantsSearchPerTerm": 3,
+    "myInstantsSelectionTimeoutMs": 45000,
+    "clearBulkDeleteAgeDays": 14,
+    "soundCloudProgressScanLimit": 20
+  },
+  "commands": {
+    "defaultPrefixes": [
+      "+Ducz",
+      "+d",
+      "+p",
+      "+play",
+      "+skip",
+      "+stop",
+      "+i",
+      "+fav",
+      "+efeito",
+      "+efeitos",
+      "+effect",
+      "+ef",
+      "+fila",
+      "+queue",
+      "+clear",
+      "+help"
+    ]
+  }
+}

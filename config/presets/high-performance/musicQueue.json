@@ -1,0 +1,8 @@
+{
+  "defaultEffectIntensity": 5,
+  "cleanupOldStreamDelayMs": 200,
+  "maxHistoryItems": 200,
+  "navCooldownMs": 250,
+  "voiceReconnectWaitMs": 4000,
+  "ipDiscoveryLogCooldownMs": 15000
+}

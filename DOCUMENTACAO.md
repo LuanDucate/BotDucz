@@ -130,7 +130,11 @@ Texto recomendado:
 - src/youtube.js: resolucao de midia YouTube e utilitarios de busca
 - src/soundcloud.js: interface de funcoes SoundCloud
 - src/spotify.js: funcoes de extracao/normalizacao para Spotify
+- src/config.js: leitura e merge de configuracoes JSON com fallback
 - src/utils.js: download/fetch utilitarios
+- config/bot.json: presenca, UI, timeouts, prefixes padrao
+- config/sources.json: limites de YouTube/Spotify/SoundCloud e concorrencia
+- config/musicQueue.json: historico, cooldowns e parametros internos da fila
 - favorites.json: armazenamento de favoritos compartilhados
 
 ## 9. Historico de modificacoes (organizado por data)
