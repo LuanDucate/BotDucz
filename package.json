@@ -1,10 +1,13 @@
 {
   "name": "botducz",
-  "version": "1.0.0",
-  "description": "Bot Discord para tocar áudios do MyInstants em canais de voz",
+  "version": "2.0.0",
+  "description": "Bot Discord de audio para canais de voz: MyInstants, YouTube, SoundCloud e Spotify com fila, efeitos e favoritos compartilhados",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js",
+    "check": "node --check index.js",
+    "start:verbose": "node index.js"
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.1",

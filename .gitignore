@@ -1,3 +1,30 @@
+# Dependencies
 node_modules/
+
+# Environment variables (keep sample)
 .env
+.env.*
+!.env.example
+
+# Runtime locks and temporary audio
+bot.lock
 *.mp3
+*.wav
+*.ogg
+
+# Logs and local outputs
+*.log
+output_bot.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local caches and coverage
+.cache/
+coverage/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
