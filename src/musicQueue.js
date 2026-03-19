@@ -11,6 +11,9 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { resolveSoundCloudTrackDetails } = require('./youtube');
+const { APP_CONFIG } = require('./config');
+
+const MQ_CFG = APP_CONFIG.musicQueue;
 
 // ============================================================
 // Estado por guild
@@ -39,7 +42,7 @@ function getGuildData(guildId) {
       nowPlayingSfxMessage: null,
       lastVoiceErrorAt: 0,
       effect: null, // currently applied effect (string key)
-      effectIntensity: 5, // intensidade do efeito (1-10)
+      effectIntensity: Number(MQ_CFG.defaultEffectIntensity) || 5, // intensidade do efeito (1-10)
       currentSongOffsetSeconds: 0,
       loop: false,
       history: [],
@@ -136,7 +139,7 @@ function cleanupOldStream(data, old) {
     killProcessSafe(old.ytdlp);
     killProcessSafe(old.ffmpeg);
     destroyStreamSafe(old.stream);
-  }, 250);
+  }, Number(MQ_CFG.cleanupOldStreamDelayMs) || 250);
 }
 
 function buildNowPlayingContent(song, queueSize, currentSequence = 0) {
@@ -444,7 +447,7 @@ async function ensureConnection(message) {
         if (lastSong) {
           if (!Array.isArray(data.history)) data.history = [];
           data.history.push(lastSong);
-          if (data.history.length > 100) data.history.shift();
+          if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
         }
         playNext(message.guildId);
       }
@@ -1075,7 +1078,7 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
     await replyFn('⏳ Aguarde um instante antes de avançar novamente.');
     return;
   }
-  data.navCooldownUntil = now + 350;
+  data.navCooldownUntil = now + (Number(MQ_CFG.navCooldownMs) || 350);
 
   if (data.queue.length === 0) {
     await replyFn('❌ Não há próxima música na fila.');
@@ -1087,7 +1090,7 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
   const skipped = data.currentSong.title;
   if (data.currentSong) {
     data.history.push(data.currentSong);
-    if (data.history.length > 100) data.history.shift();
+    if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
   }
 
   // Get next song WITHOUT revealing it yet
@@ -1183,7 +1186,7 @@ function wireConnectionLifecycle(data, guildId) {
 
     // Se for erro comum de IP discovery, limita logs a cada 30s por guild
     if (isIpDiscoveryError) {
-      if (now - data.lastVoiceErrorAt < 30_000) return;
+      if (now - data.lastVoiceErrorAt < (Number(MQ_CFG.ipDiscoveryLogCooldownMs) || 30_000)) return;
       data.lastVoiceErrorAt = now;
     }
 
@@ -1206,8 +1209,8 @@ function wireConnectionLifecycle(data, guildId) {
 
     try {
       await Promise.race([
-        entersState(boundConnection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(boundConnection, VoiceConnectionStatus.Connecting, 5_000),
+        entersState(boundConnection, VoiceConnectionStatus.Signalling, Number(MQ_CFG.voiceReconnectWaitMs) || 5_000),
+        entersState(boundConnection, VoiceConnectionStatus.Connecting, Number(MQ_CFG.voiceReconnectWaitMs) || 5_000),
       ]);
     } catch {
       if (data.connection !== boundConnection) return;
@@ -1280,7 +1283,7 @@ async function jumpTo(guildId, position) {
 
   if (data.currentSong) data.history.push(data.currentSong);
   if (skippedBeforeTarget.length > 0) data.history.push(...skippedBeforeTarget);
-  while (data.history.length > 100) data.history.shift();
+  while (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
 
   data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
   data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
@@ -1315,7 +1318,7 @@ function playPrevious(message) {
 
   const now = Date.now();
   if (now < (data.navCooldownUntil || 0)) return false;
-  data.navCooldownUntil = now + 350;
+  data.navCooldownUntil = now + (Number(MQ_CFG.navCooldownMs) || 350);
 
   const prev = data.history.pop();
   const curr = data.currentSong;

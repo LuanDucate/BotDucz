@@ -41,6 +41,7 @@ const {
   getSpotifyOEmbedTitle,
   getSpotifyTrackSearchQuery,
 } = require('./src/spotify');
+const { APP_CONFIG } = require('./src/config');
 const {
   addYouTube,
   addPlaylist,
@@ -72,6 +73,8 @@ const { toggleLoop, getLoop, playPrevious, buildMusicControlRow } = require('./s
 const lockFilePath = path.join(__dirname, 'bot.lock');
 const BOT_VERSION = '2.0.0';
 const BOT_BUILD_TAG = `v${BOT_VERSION}`;
+const BOT_CFG = APP_CONFIG.bot;
+const SOURCES_CFG = APP_CONFIG.sources;
 
 function isProcessRunning(pid) {
   try {
@@ -220,7 +223,7 @@ const activeSoundCloudProgressMessages = new Map();
 const soundCloudProgressRenderPromises = new Map();
 const soundCloudProgressAnchorMessageIds = new Map();
 const autoLeaveTimers = new Map();
-const DEFAULT_AUTO_LEAVE_MINUTES = 2;
+const DEFAULT_AUTO_LEAVE_MINUTES = Number(BOT_CFG.autoLeave?.defaultMinutes) || 2;
 const parsedAutoLeaveMinutes = Number.parseFloat(process.env.AUTO_LEAVE_MINUTES || '');
 const AUTO_LEAVE_MINUTES = Number.isFinite(parsedAutoLeaveMinutes) && parsedAutoLeaveMinutes > 0
   ? parsedAutoLeaveMinutes
@@ -317,7 +320,9 @@ async function handleBotVoiceMove(oldState, newState) {
 
 async function cleanupStaleSoundCloudProgressMessages(channel, keepMessageId = null) {
   if (!channel?.messages?.fetch || !client.user?.id) return;
-  const recent = await channel.messages.fetch({ limit: 30 }).catch(() => null);
+  const recent = await channel.messages
+    .fetch({ limit: Number(BOT_CFG.ui?.soundCloudProgressScanLimit) || 30 })
+    .catch(() => null);
   if (!recent) return;
 
   const deletions = [];
@@ -401,10 +406,14 @@ function updateBotPresence(songTitle = null) {
   if (!client.user) return;
 
   const title = String(songTitle || '').trim();
-  const activityName = title ? `${title} | +help`.slice(0, 128) : '+help';
+  const suffix = String(BOT_CFG.presence?.playingSuffix || '| +help');
+  const idleText = String(BOT_CFG.presence?.idleText || '+help');
+  const maxActivityLength = Number(BOT_CFG.presence?.maxActivityLength) || 128;
+  const presenceStatus = String(BOT_CFG.presence?.status || 'online');
+  const activityName = title ? `${title} ${suffix}`.slice(0, maxActivityLength) : idleText;
   client.user.setPresence({
     activities: [{ name: activityName, type: 2 }],
-    status: 'online',
+    status: presenceStatus,
   });
 }
 
@@ -426,7 +435,7 @@ function enqueueSoundCloudTrackResolve(guildId, track) {
   queue.pending.push(track);
 
   const pump = () => {
-    while (queue.active < 2 && queue.pending.length > 0) {
+    while (queue.active < (Number(SOURCES_CFG.soundcloud?.resolveConcurrency) || 2) && queue.pending.length > 0) {
       const nextTrack = queue.pending.shift();
       queue.active += 1;
 
@@ -468,11 +477,13 @@ function clearSpotifyLoadSession(guildId, token = null) {
 }
 
 async function resolveQueriesToVideos(queries, { maxItems = 30, concurrency = 5 } = {}) {
-  const capped = queries.slice(0, Math.max(1, maxItems));
+  const effectiveMaxItems = Number(maxItems) || Number(SOURCES_CFG.resolution?.maxItems) || 30;
+  const effectiveConcurrency = Number(concurrency) || Number(SOURCES_CFG.resolution?.concurrency) || 5;
+  const capped = queries.slice(0, Math.max(1, effectiveMaxItems));
   const results = [];
 
-  for (let i = 0; i < capped.length; i += concurrency) {
-    const chunk = capped.slice(i, i + concurrency);
+  for (let i = 0; i < capped.length; i += effectiveConcurrency) {
+    const chunk = capped.slice(i, i + effectiveConcurrency);
     const resolvedChunk = await Promise.all(
       chunk.map(async (q) => {
         try {
@@ -504,7 +515,9 @@ const client = new Client({
 });
 
 // Prefixos padrão (inclui +p, +play, +skip, +stop, +i, +efeito/+ef e +fila/+queue)
-const DEFAULT_PREFIXES = ['+Ducz', '+d', '+p', '+play', '+skip', '+stop', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help'];
+const DEFAULT_PREFIXES = Array.isArray(BOT_CFG.commands?.defaultPrefixes)
+  ? BOT_CFG.commands.defaultPrefixes
+  : ['+Ducz', '+d', '+p', '+play', '+skip', '+stop', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help'];
 
 // IDs de usuário (Discord) autorizados a usar +killbot
 // Adicione aqui outros IDs separados por vírgula, se quiser.
@@ -898,7 +911,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
     return message.reply('📋 A fila está vazia.');
   }
 
-  const pageSize = 8;
+  const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
   const totalPages = Math.max(1, Math.ceil(queue.length / pageSize));
   const normalizedPage = Math.min(Math.max(0, page), totalPages - 1);
 
@@ -971,7 +984,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
   if (!timeoutId) {
     timeoutId = setTimeout(() => {
       pendingQueueMessages.delete(reply.id);
-    }, 5 * 60 * 1000);
+    }, Number(BOT_CFG.ui?.dismissTimeoutMs) || 5 * 60 * 1000);
   }
 
   pendingQueueMessages.set(reply.id, {
@@ -997,7 +1010,7 @@ async function sendDismissableEffectMessage(message, content) {
 
   const timeoutId = setTimeout(() => {
     pendingEffectMessages.delete(sent.id);
-  }, 5 * 60 * 1000);
+  }, Number(BOT_CFG.ui?.dismissTimeoutMs) || 5 * 60 * 1000);
 
   pendingEffectMessages.set(sent.id, {
     userId: requesterId,
@@ -1021,7 +1034,7 @@ async function sendDismissableHelpMessage(message) {
 
   const timeoutId = setTimeout(() => {
     pendingHelpMessages.delete(sent.id);
-  }, 5 * 60 * 1000);
+  }, Number(BOT_CFG.ui?.dismissTimeoutMs) || 5 * 60 * 1000);
 
   pendingHelpMessages.set(sent.id, {
     userId: requesterId,
@@ -1032,7 +1045,7 @@ async function sendDismissableHelpMessage(message) {
 }
 
 function startQueueLiveRefresh() {
-  const INTERVAL_MS = 4000;
+  const INTERVAL_MS = Number(BOT_CFG.ui?.queueRefreshIntervalMs) || 4000;
   setInterval(async () => {
     for (const [messageId, entry] of pendingQueueMessages.entries()) {
       if (!entry?.message) continue;
@@ -1111,7 +1124,8 @@ async function clearBotMessagesByDuration(message, rawDuration) {
 
   const now = Date.now();
   const cutoff = now - windowMs;
-  const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+  const bulkDeleteAgeDays = Number(BOT_CFG.ui?.clearBulkDeleteAgeDays) || 14;
+  const fourteenDaysMs = bulkDeleteAgeDays * 24 * 60 * 60 * 1000;
   const activeNowPlayingMessageId = getNowPlayingMessageId(message.guildId);
   const activeSoundCloudProgressId = activeSoundCloudProgressMessages.get(message.guildId)?.id || null;
 
@@ -1390,16 +1404,18 @@ async function handlePlayQuery(message, query) {
         let progressMsg = await upsertSoundCloudProgressMessage(message, '📋 Lendo playlist do SoundCloud...').catch(() => null);
         let totalAdded = 0;
         const pending = [];
+        const soundCloudFirstBatchSize = Number(SOURCES_CFG.soundcloud?.firstBatchSize) || 1;
+        const soundCloudBatchSize = Number(SOURCES_CFG.soundcloud?.batchSize) || 5;
 
         // Flush pending buffer with deterministic batching:
         // - First batch: exactly 1 track (for instant 1st play)
         // - Subsequent batches: exactly 5 tracks each
-        const flushPending = async (isFinal = false, maxPerBatch = 5) => {
+        const flushPending = async (isFinal = false, maxPerBatch = soundCloudBatchSize) => {
           if (!pending.length) return;
           
           // On first flush (totalAdded === 0), take only first 1 track
           // On subsequent flushes, take up to maxPerBatch (5) tracks
-          const batchSize = totalAdded === 0 ? 1 : maxPerBatch;
+          const batchSize = totalAdded === 0 ? soundCloudFirstBatchSize : maxPerBatch;
           const chunk = pending.splice(0, batchSize);
           
           if (!chunk.length) return;
@@ -1424,7 +1440,7 @@ async function handlePlayQuery(message, query) {
           // Flush deterministically:
           // - On first track: flush just that 1
           // - When pending reaches 5+ tracks after first: flush 5 at a time
-          if (totalAdded === 0 || pending.length >= 5) {
+          if (totalAdded === 0 || pending.length >= soundCloudBatchSize) {
             await flushPending();
           }
         }
@@ -1478,7 +1494,7 @@ async function handlePlayQuery(message, query) {
               soundCloudProgressRenderPromises.delete(message.guildId);
               soundCloudProgressAnchorMessageIds.delete(message.guildId);
               await finalMsg.delete().catch(() => {});
-            }, 5000);
+            }, Number(SOURCES_CFG.soundcloud?.finalStatusDeleteDelayMs) || 5000);
           } else {
             activeSoundCloudProgressMessages.delete(message.guildId);
             soundCloudProgressRenderPromises.delete(message.guildId);
@@ -1515,16 +1531,17 @@ async function handlePlayQuery(message, query) {
       let progressMsg = await message.reply('📋 Lendo playlist/álbum do Spotify...').catch(() => null);
       console.log('📋 Spotify coleção detectada. Iniciando extração de faixas...');
 
-      let trackQueries = await getSpotifyCollectionTrackQueriesFromEmbed(input, 500);
+      const spotifyCollectionMaxTracks = Number(SOURCES_CFG.spotify?.collectionMaxTracks) || 500;
+      let trackQueries = await getSpotifyCollectionTrackQueriesFromEmbed(input, spotifyCollectionMaxTracks);
 
       // Fallback via API pública do Spotify quando disponível.
       if (!trackQueries.length) {
-        trackQueries = await getSpotifyCollectionTrackQueriesApi(input, 500);
+        trackQueries = await getSpotifyCollectionTrackQueriesApi(input, spotifyCollectionMaxTracks);
       }
 
       // Fallback para versões/ambientes onde API não responder.
       if (!trackQueries.length) {
-        trackQueries = await getSpotifyCollectionTrackQueriesFallback(input, 500);
+        trackQueries = await getSpotifyCollectionTrackQueriesFallback(input, spotifyCollectionMaxTracks);
       }
       if (!trackQueries.length) {
         clearSpotifyLoadSession(message.guildId, loadToken);
@@ -1540,13 +1557,13 @@ async function handlePlayQuery(message, query) {
       console.log(`📋 Spotify: ${totalTarget} faixa(s) alvo para resolver no YouTube.`);
 
       const seenUrls = new Set();
-      const firstChunkSize = 1;
-      const chunkSize = 15;
+      const firstChunkSize = Number(SOURCES_CFG.spotify?.initialBatchSize) || 1;
+      const chunkSize = Number(SOURCES_CFG.spotify?.batchSize) || 15;
       const firstChunk = targetQueries.slice(0, firstChunkSize);
 
       const firstVideosRaw = await resolveQueriesToVideos(firstChunk, {
         maxItems: firstChunk.length,
-        concurrency: 1,
+        concurrency: Number(SOURCES_CFG.spotify?.initialResolveConcurrency) || 1,
       });
       if (!isSpotifyLoadSessionActive(message.guildId, loadToken)) return;
 
@@ -1580,7 +1597,7 @@ async function handlePlayQuery(message, query) {
         const chunk = targetQueries.slice(i, i + chunkSize);
         const chunkVideosRaw = await resolveQueriesToVideos(chunk, {
           maxItems: chunk.length,
-          concurrency: 15,
+          concurrency: Number(SOURCES_CFG.spotify?.batchResolveConcurrency) || 15,
         });
 
         if (!isSpotifyLoadSessionActive(message.guildId, loadToken)) return;
@@ -1625,7 +1642,10 @@ async function handlePlayQuery(message, query) {
         return message.reply('❌ Não consegui identificar o artista nesse link do Spotify.');
       }
 
-      const videos = await resolveYouTubeSearchMany(`${artistName} topic`, 15);
+      const videos = await resolveYouTubeSearchMany(
+        `${artistName} topic`,
+        Number(SOURCES_CFG.youtube?.artistSearchResults) || 15
+      );
       if (!videos.length) {
         return message.reply('❌ Não encontrei músicas desse artista no YouTube.');
       }
@@ -1640,10 +1660,10 @@ async function handlePlayQuery(message, query) {
         console.log('📋 Carregando playlist...');
 
         // Se a primeira tentativa falhar (lista vazia), tenta novamente uma vez.
-        let videos = await getPlaylistVideos(input);
+        let videos = await getPlaylistVideos(input, Number(SOURCES_CFG.youtube?.playlistMaxVideos) || 50);
         if (!videos || videos.length === 0) {
           console.log('⚠️ Falha ao carregar playlist, tentando novamente...');
-          videos = await getPlaylistVideos(input);
+          videos = await getPlaylistVideos(input, Number(SOURCES_CFG.youtube?.playlistMaxVideos) || 50);
         }
 
         if (!videos || videos.length === 0) {
@@ -1672,28 +1692,31 @@ async function handlePlayQuery(message, query) {
 }
 
 async function getMyInstantsSuggestions(query, maxOptions = 3) {
+  const effectiveMaxOptions = Number(maxOptions) || Number(BOT_CFG.ui?.myInstantsSuggestionButtons) || 3;
   const terms = normalizeSearchTerms(query);
   const seen = new Set();
   const results = [];
 
   for (const term of terms) {
-    const found = await searchMyInstants(term, 5);
+    const found = await searchMyInstants(term, Number(BOT_CFG.ui?.myInstantsSearchPerTerm) || 5);
     for (const item of found) {
       const key = item.pageUrl || item.mp3Url;
       if (!key || seen.has(key)) continue;
       seen.add(key);
       results.push(item);
-      if (results.length >= maxOptions) return results;
+      if (results.length >= effectiveMaxOptions) return results;
     }
-    if (results.length >= maxOptions) break;
+    if (results.length >= effectiveMaxOptions) break;
   }
 
   return results;
 }
 
 async function offerMyInstantsSelections(message, searchQuery, options) {
+  const maxSuggestionButtons = Number(BOT_CFG.ui?.myInstantsSuggestionButtons) || 3;
+  const suggestionTimeoutMs = Number(BOT_CFG.ui?.myInstantsSelectionTimeoutMs) || 60_000;
   const row = new ActionRowBuilder();
-  const components = options.slice(0, 3).map((opt, index) =>
+  const components = options.slice(0, maxSuggestionButtons).map((opt, index) =>
     new ButtonBuilder()
       .setCustomId(`myinstants_${index}`)
       .setLabel(`${index + 1}`)
@@ -1703,7 +1726,7 @@ async function offerMyInstantsSelections(message, searchQuery, options) {
   row.addComponents(components);
 
   const description = options
-    .slice(0, 3)
+    .slice(0, maxSuggestionButtons)
     .map((opt, index) => `**${index + 1}.** ${opt.title}`)
     .join('\n');
 
@@ -1719,11 +1742,11 @@ async function offerMyInstantsSelections(message, searchQuery, options) {
       })
       .catch(() => {});
 
-    existing.options = options.slice(0, 3);
+    existing.options = options.slice(0, maxSuggestionButtons);
     existing.timeoutId = setTimeout(() => {
       pendingMyInstantsSelection.delete(message.author.id);
       existing.selectionMessage.delete().catch(() => {});
-    }, 60_000);
+    }, suggestionTimeoutMs);
 
     return;
   }
@@ -1738,13 +1761,13 @@ async function offerMyInstantsSelections(message, searchQuery, options) {
     if (!entry) return;
     pendingMyInstantsSelection.delete(message.author.id);
     reply.delete().catch(() => {});
-  }, 60_000);
+  }, suggestionTimeoutMs);
 
   pendingMyInstantsSelection.set(message.author.id, {
     messageId: reply.id,
     originMessage: message,
     selectionMessage: reply,
-    options: options.slice(0, 3),
+    options: options.slice(0, maxSuggestionButtons),
     searchQuery,
     timeoutId,
   });
@@ -1961,7 +1984,7 @@ client.on('messageCreate', async (message) => {
         return message.reply('⭐ A lista compartilhada ainda não tem favoritos. Use `+i <texto>` e clique na reação ⭐ para salvar.');
       }
 
-      const lines = favs.slice(0, 20).map((f, i) => {
+      const lines = favs.slice(0, Number(BOT_CFG.ui?.favoritesPreviewLimit) || 20).map((f, i) => {
         const q = typeof f === 'string' ? f : f.query;
         return `**${i + 1}.** ${q}`;
       });
@@ -2172,7 +2195,7 @@ client.on('messageCreate', async (message) => {
       return message.reply(
         `Prefixos atuais: ${getPrefixes(message.guildId).join(', ')}\n` +
           `Prefixos personalizados: ${custom.length ? custom.join(', ') : 'nenhum'}\n` +
-          'Use `+d prefix add <prefixo>` ou `+d prefix remove <prefixo>` para ajustar.'
+          'Uso: `+d prefix [add|remove|reset] <prefixo>`'
       );
     }
 

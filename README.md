@@ -24,7 +24,35 @@ Bot de Discord para reproduzir audio em canal de voz com suporte a:
 - src/youtube.js: funcoes de YouTube e utilitarios de busca via yt-dlp
 - src/soundcloud.js: ponto unico para funcoes SoundCloud
 - src/spotify.js: ponto unico para funcoes Spotify
+- src/config.js: loader central de configuracoes JSON com fallback seguro
 - src/utils.js: utilitarios HTTP/download
+
+## Configuracao por JSON (edicao facil)
+
+Agora voce pode ajustar comportamento do bot sem editar codigo, usando:
+
+- config/bot.json
+- config/sources.json
+- config/musicQueue.json
+
+Principais opcoes configuraveis:
+
+- Presenca do bot ocioso/tocando (+help e sufixo)
+- Auto-leave padrao (quando nao usar AUTO_LEAVE_MINUTES no .env)
+- Timeouts de botoes (help/fila/efeitos)
+- Tamanho da pagina de +fila
+- Frequencia de refresh da fila em tela
+- Quantidade de favoritos exibidos no +fav
+- Quantidade de sugestoes e timeout de selecao do +i
+- Limites de playlist YouTube/Spotify
+- Batching e concorrencia de carregamento Spotify/SoundCloud
+- Cooldown de navegacao e tamanho maximo de historico da fila
+
+Importante:
+
+- Os valores padrao ja estao iguais ao comportamento atual do bot.
+- Se algum JSON estiver faltando ou invalido, o bot usa fallback interno sem quebrar.
+- Depois de alterar um JSON, reinicie o bot para aplicar as mudancas.
 
 ## Biografia sugerida do bot (Discord)
 
