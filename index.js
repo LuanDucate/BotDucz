@@ -134,7 +134,6 @@ function ensureSingleInstance() {
       const matches = [...output.matchAll(/ProcessId=(\d+)/g)].map((m) => Number(m[1]));
       for (const pid of matches) {
         if (!pid || pid === currentPid) continue;
-          '🦆 Reaja com **🦆** para repetir • 📢 **📢** para tocar mais alto (uma vez) • ⭐ **⭐** para favoritar/remover com 1 mensagem dinamica por instant',
         const blockRegex = new RegExp(`ProcessId=${pid}[\\s\\S]*?CommandLine=(.*?)(?:\\r?\\n\\r?\\n|$)`, 'i');
         const m = output.match(blockRegex);
         const cmd = m ? (m[1] || '') : '';
@@ -3707,38 +3706,6 @@ client.on('interactionCreate', async (interaction) => {
     if (isPlaylistLoadInProgress(interaction.guildId)) {
       return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Loop Playlist.', ephemeral: true });
     }
-    await interaction.deferUpdate().catch(() => {});
-    const loopInfo = toggleLoopPlaylist(interaction.guildId);
-    // Se ativou loop, navegar para a página da música atual com índice preciso
-    const ps = Number(BOT_CFG.ui?.queuePageSize) || 8;
-    const targetPage = loopInfo.enabled ? Math.floor((loopInfo.currentIndex || 0) / ps) : 0;
-    await showQueueMessage(interaction.message, targetPage, interaction.message).catch(() => {});
-    return;
-  }
-
-  if (interaction.customId.startsWith('queue_restart_')) {
-    const entry = pendingQueueMessages.get(interaction.message.id);
-    if (!entry) return interaction.deferUpdate();
-
-    if (isPlaylistLoadInProgress(interaction.guildId)) {
-      return interaction.reply({
-        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Reiniciar playlist.',
-        ephemeral: true,
-      });
-    }
-
-    await interaction.deferUpdate().catch(() => {});
-    restartPlaylist(interaction.guildId);
-    // Força o estado interno da paginação para a primeira página.
-    entry.page = 0;
-    pendingQueueMessages.set(interaction.message.id, entry);
-    await showQueueMessage(interaction.message, 0, interaction.message).catch(() => {});
-    return;
-  }
-
-  if (interaction.customId.startsWith('queue_loopplaylist_')) {
-    const entry = pendingQueueMessages.get(interaction.message.id);
-    if (!entry) return interaction.deferUpdate();
     await interaction.deferUpdate().catch(() => {});
     const loopInfo = toggleLoopPlaylist(interaction.guildId);
     // Se ativou loop, navegar para a página da música atual com índice preciso

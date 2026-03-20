@@ -145,51 +145,6 @@ function refreshLoopPlaylistSnapshot(data) {
   data.playlistFull = buildCanonicalPlaylist(data);
 }
 
-function buildCanonicalPlaylist(data) {
-  if (!data) return [];
-  const all = [
-    ...(Array.isArray(data.playlistFull) ? data.playlistFull : []),
-    ...(Array.isArray(data.history) ? data.history : []),
-    ...(data.currentSong ? [data.currentSong] : []),
-    ...(Array.isArray(data.queue) ? data.queue : []),
-  ];
-
-  const seenSeq = new Set();
-  const seenFallback = new Set();
-  const uniq = [];
-
-  for (const song of all) {
-    if (!song) continue;
-    const seq = Number(song.sequence);
-    if (Number.isFinite(seq)) {
-      const k = `seq:${seq}`;
-      if (seenSeq.has(k)) continue;
-      seenSeq.add(k);
-      uniq.push(song);
-      continue;
-    }
-
-    const k = `fallback:${String(song.url || '')}|${String(song.title || '')}`;
-    if (seenFallback.has(k)) continue;
-    seenFallback.add(k);
-    uniq.push(song);
-  }
-
-  // Ordem estável pela sequência original de inserção.
-  uniq.sort((a, b) => {
-    const sa = Number.isFinite(Number(a?.sequence)) ? Number(a.sequence) : Number.MAX_SAFE_INTEGER;
-    const sb = Number.isFinite(Number(b?.sequence)) ? Number(b.sequence) : Number.MAX_SAFE_INTEGER;
-    return sa - sb;
-  });
-
-  return uniq.map((s) => ({ ...s }));
-}
-
-function refreshLoopPlaylistSnapshot(data) {
-  if (!data || !data.loopPlaylist) return;
-  data.playlistFull = buildCanonicalPlaylist(data);
-}
-
 function setEffect(guildId, effect) {
   const data = getGuildData(guildId);
   data.effect = effect;
