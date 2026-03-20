@@ -134,7 +134,6 @@ function ensureSingleInstance() {
       const matches = [...output.matchAll(/ProcessId=(\d+)/g)].map((m) => Number(m[1]));
       for (const pid of matches) {
         if (!pid || pid === currentPid) continue;
-          '🦆 Reaja com **🦆** para repetir • 📢 **📢** para tocar mais alto (uma vez) • ⭐ **⭐** para favoritar/remover com 1 mensagem dinamica por instant',
         const blockRegex = new RegExp(`ProcessId=${pid}[\\s\\S]*?CommandLine=(.*?)(?:\\r?\\n\\r?\\n|$)`, 'i');
         const m = output.match(blockRegex);
         const cmd = m ? (m[1] || '') : '';

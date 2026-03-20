@@ -51,8 +51,6 @@ function getGuildData(guildId) {
       loop: false,
       loopPlaylist: false,
       playlistFull: [],
-      loopPlaylist: false,
-      playlistFull: [],
       history: [],
       sequenceCounter: 0,
       currentSequence: 0,
@@ -63,9 +61,6 @@ function getGuildData(guildId) {
       suppressNextErrorAdvanceCount: 0,
       suppressAdvanceUntil: 0,
       navCooldownUntil: 0,
-      effectApplyCooldownUntil: 0,
-      effectApplyTimer: null,
-      playNextTimer: null,
       effectApplyCooldownUntil: 0,
       effectApplyTimer: null,
       playNextTimer: null,
@@ -235,18 +230,6 @@ function clearScheduledTimers(data) {
   }
 }
 
-function clearScheduledTimers(data) {
-  if (!data) return;
-  if (data.effectApplyTimer) {
-    clearTimeout(data.effectApplyTimer);
-    data.effectApplyTimer = null;
-  }
-  if (data.playNextTimer) {
-    clearTimeout(data.playNextTimer);
-    data.playNextTimer = null;
-  }
-}
-
 function cleanupOldStream(data, old) {
   if (!old) return;
   setTimeout(() => {
@@ -257,13 +240,10 @@ function cleanupOldStream(data, old) {
 }
 
 function buildNowPlayingContent(song, queueSize, effect, effectIntensity, currentSequence = 0) {
-function buildNowPlayingContent(song, queueSize, effect, effectIntensity, currentSequence = 0) {
   const sequenceMsg = currentSequence > 0 ? ` | #${currentSequence}` : '';
   const queueMsg = queueSize > 0 ? ` | ${queueSize} na fila` : '';
   const effectMsg = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
-  const effectMsg = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
   const linkRef = song?.url && song.url.startsWith('http') ? `\n🔗 ${song.url}` : '';
-  return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${effectMsg}${linkRef}`;
   return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${effectMsg}${linkRef}`;
 }
 
@@ -273,7 +253,6 @@ async function upsertNowPlayingMessage(guildId, opts = {}) {
   const forceResend = Boolean(opts?.forceResend);
 
   const payload = {
-    content: buildNowPlayingContent(data.currentSong, data.queue.length, data.effect, data.effectIntensity || 5, data.currentSequence || 0),
     content: buildNowPlayingContent(data.currentSong, data.queue.length, data.effect, data.effectIntensity || 5, data.currentSequence || 0),
     components: [buildMusicControlRow(guildId)],
   };
@@ -354,7 +333,6 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   // Contabilizamos para ignorar esse Idle fantasma e não avançar duas vezes.
   const playerStatus = data.musicPlayer?.state?.status;
   const replacingActiveResource =
-    Boolean(data.currentStream) &&
     Boolean(data.currentStream) &&
     Boolean(data.currentSong) &&
     playerStatus &&
@@ -462,19 +440,6 @@ function applyEffectNow(guildId) {
   }
   data.effectApplyCooldownUntil = now + EFFECT_APPLY_COOLDOWN_MS;
 
-  const now = Date.now();
-  if (now < (data.effectApplyCooldownUntil || 0)) {
-    if (!data.effectApplyTimer) {
-      const waitMs = Math.max(15, (data.effectApplyCooldownUntil || now) - now);
-      data.effectApplyTimer = setTimeout(() => {
-        data.effectApplyTimer = null;
-        applyEffectNow(guildId);
-      }, waitMs);
-    }
-    return true;
-  }
-  data.effectApplyCooldownUntil = now + EFFECT_APPLY_COOLDOWN_MS;
-
   // Pausa o player imediatamente para congelar o playbackDuration no ponto exato.
   // Isso dá uma leitura de posição precisa (mesmo princípio do SFX pause/unpause).
   // O player.play(newResource) mais abaixo retomará a reprodução automaticamente.
@@ -493,10 +458,7 @@ function applyEffectNow(guildId) {
   const baseOffsetMs = (data.currentSongOffsetSeconds || 0) * 1000;
   // Ajuste fino conservador para reduzir corte sem acumular drift em múltiplas trocas.
   const BASE_FINE_TUNE_BACK_MS = 220;
-  // Ajuste fino conservador para reduzir corte sem acumular drift em múltiplas trocas.
-  const BASE_FINE_TUNE_BACK_MS = 220;
   const EFFECT_FINE_TUNE_EXTRA_MS = {
-    nightcore: 90,
     nightcore: 90,
   };
   const extraBackMs = EFFECT_FINE_TUNE_EXTRA_MS[data.effect] || 0;
@@ -519,16 +481,6 @@ function applyEffectNow(guildId) {
   playSong(guildId, currentSong, seekSeconds, true);
 
   return true;
-}
-
-function schedulePlayNext(guildId, delayMs = 0) {
-  const data = guilds.get(guildId);
-  if (!data) return;
-  if (data.playNextTimer) return;
-  data.playNextTimer = setTimeout(() => {
-    data.playNextTimer = null;
-    playNext(guildId).catch(() => {});
-  }, Math.max(0, Number(delayMs) || 0));
 }
 
 function schedulePlayNext(guildId, delayMs = 0) {
@@ -692,14 +644,12 @@ const VALID_EFFECTS = [
   'bassboost', 'nightcore', 'helium', 'slow', 'echo',
   'reverb', 'karaoke', '8d', 'distortion', 'vaporwave', 'tremolo',
   'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
-  'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'glitch', 'reverse', 'drunk', 'lag', '8bit',
 ];
 
 const INTENSITY_EFFECTS = [
   'bassboost', 'nightcore', 'helium', 'slow', 'echo',
   'reverb', '8d', 'distortion', 'vaporwave', 'tremolo',
-  'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'glitch', 'reverse', 'drunk', 'lag', '8bit',
 ];
@@ -718,9 +668,7 @@ const EFFECT_DESCRIPTIONS = {
   tremolo: 'Oscila o volume rapidamente, criando pulsacao.',
   chipmunk: 'Pitch alto estilo desenho animado.',
   alvin: 'Esquilo dos filmes — voz bem aguda e acelerada estilo Alvin e os Esquilos!',
-  alvin: 'Esquilo dos filmes — voz bem aguda e acelerada estilo Alvin e os Esquilos!',
   giant: 'Pitch grave e pesado, estilo gigante.',
-  robot: 'Robot metalico pesado com foco de voz (estilo sintetico agressivo).',
   robot: 'Robot metalico pesado com foco de voz (estilo sintetico agressivo).',
   radio: 'Som de radio velho, limitado e chiado.',
   telefone: 'Faixa de telefone (300Hz-3400Hz).',
@@ -743,65 +691,6 @@ function tieredIntensityT(level) {
   if (l <= 3) return lerp(0.00, 0.28, (l - 1) / 2);
   if (l <= 7) return lerp(0.35, 0.72, (l - 4) / 3);
   return lerp(0.80, 1.00, (l - 8) / 2);
-}
-
-function buildRobotVoiceFilter(intensity = 5) {
-  const t = tieredIntensityT(intensity);
-  // Filtro estilo Blitzcrank: ring-mod agressivo, crusher pesado, ressonância metálica.
-  const hp = Math.round(lerp(180, 320, t));
-  const lp = Math.round(lerp(4800, 3000, t));
-  const lowCut = lerp(-5.0, -11.0, t).toFixed(1);
-  const metalPeak = lerp(2.0, 8.0, t).toFixed(1);    // ressonância de caixa metálica ~800 Hz
-  const presence1 = lerp(4.0, 12.0, t).toFixed(1);   // presença de voz ~1200 Hz
-  const presence2 = lerp(3.0, 8.0, t).toFixed(1);    // ar / inteligibilidade ~2500 Hz
-  const ringFreq = lerp(65.0, 160.0, t).toFixed(1);  // ring-mod mais alto e agressivo
-  const ringDepth = lerp(0.58, 0.99, t).toFixed(2);  // profundidade quase total no máximo
-  const crusherBits = Math.round(lerp(8, 4, t));      // crusher mais destrutivo
-  const crusherIn = lerp(1.20, 2.30, t).toFixed(2);  // overdrive maior na entrada
-  const robotRate = Math.round(lerp(22050, 8000, t)); // downsampling mais agressivo
-  const metalDelay = Math.round(lerp(8, 20, t));
-  const metalDecay = lerp(0.12, 0.32, t).toFixed(2);
-  const makeup = lerp(1.22, 1.90, t).toFixed(2);
-
-  return [
-    // Foca mais no centro (voz) — proporção levemente maior.
-    'pan=stereo|c0=0.65*FL+0.35*FR|c1=0.65*FR+0.35*FL',
-    `highpass=f=${hp}`,
-    `lowpass=f=${lp}`,
-    `equalizer=f=260:t=q:w=1.1:g=${lowCut}`,
-    `equalizer=f=800:t=q:w=0.8:g=${metalPeak}`,
-    `equalizer=f=1200:t=q:w=1.2:g=${presence1}`,
-    `equalizer=f=2500:t=q:w=1.0:g=${presence2}`,
-    `tremolo=f=${ringFreq}:d=${ringDepth}`,
-    `acrusher=level_in=${crusherIn}:level_out=1:bits=${crusherBits}:mode=log`,
-    `aresample=${robotRate}`,
-    'aresample=48000',
-    `aecho=0.80:0.44:${metalDelay}:${metalDecay}`,
-    'compand=attacks=0.001:decays=0.06:points=-90/-90|-40/-30|-24/-14|-10/-4|0/-1.5',
-    `volume=${makeup}`,
-    'alimiter=limit=0.94:level=disabled',
-  ].join(',');
-}
-
-function buildAlvinFilter(intensity = 5) {
-  const t = tieredIntensityT(intensity);
-  // Alvin e os Esquilos: pitch ~+7 a +12 semitons, levemente acelerado (fiel aos filmes).
-  // +7 semi = 2^(7/12) ≈ 1.498 | +12 semi = 2^(12/12) = 2.000
-  const rate = lerp(1.50, 2.00, t).toFixed(4);
-  // Não corrige totalmente o tempo — fica levemente mais rápido (estilo filme).
-  const tempo = lerp(0.94, 0.72, t).toFixed(3);
-  const treble = lerp(3.5, 8.0, t).toFixed(1);        // brilho característico do esquilo
-  const presence = lerp(2.5, 6.5, t).toFixed(1);     // clareza da voz aguda
-  const compMakeup = lerp(1.5, 3.5, t).toFixed(1);   // punch para deixar a voz "no ar"
-
-  return [
-    `asetrate=44100*${rate}`,
-    'aresample=44100',
-    `atempo=${tempo}`,
-    `treble=g=${treble}`,
-    `equalizer=f=3000:t=q:w=1.0:g=${presence}`,
-    `acompressor=threshold=-20dB:ratio=3:attack=5:release=60:makeup=${compMakeup}`,
-  ].join(',');
 }
 
 function buildRobotVoiceFilter(intensity = 5) {
@@ -960,16 +849,12 @@ function buildEffectFilter(effect, intensity = 5) {
     }
     case 'alvin':
       return buildAlvinFilter(intensity);
-    case 'alvin':
-      return buildAlvinFilter(intensity);
     case 'giant': {
       const rate = lerp(0.95, 0.56, t).toFixed(4);
       const tempo = lerp(0.99, 0.83, t).toFixed(3);
       const bass = lerp(1.5, 8.0, t).toFixed(1);
       return `asetrate=44100*${rate},aresample=44100,atempo=${tempo},equalizer=f=110:t=q:w=1.2:g=${bass}`;
     }
-    case 'robot':
-      return buildRobotVoiceFilter(intensity);
     case 'robot':
       return buildRobotVoiceFilter(intensity);
     case 'radio': {
@@ -1063,30 +948,15 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
     ].join(',');
   };
 
-
-  const buildMasterPostFilter = () => {
-    // Cadeia final leve para segurar picos e manter consistência sem custo alto.
-    return [
-      'acompressor=threshold=-17dB:ratio=2.2:attack=5:release=140:makeup=1.16',
-      'volume=1.08',
-      'alimiter=limit=0.98:level=disabled',
-    ].join(',');
-  };
-
   const ytdlp = spawn('yt-dlp', [
     '-f', 'bestaudio/best',
     '-o', '-',
     '--quiet',
     '--no-warnings',
     '--no-progress',
-    '--no-progress',
     '--no-playlist',
     '--extractor-args', 'youtube:player_client=android',
     url,
-  ], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -1139,19 +1009,12 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
   const fade = smoothSwitch ? 'afade=t=in:st=0:d=0.06' : null;
   const master = buildMasterPostFilter();
   const fullFilter = [seekFilter, filter, fade, master].filter(Boolean).join(',');
-  const fade = smoothSwitch ? 'afade=t=in:st=0:d=0.06' : null;
-  const master = buildMasterPostFilter();
-  const fullFilter = [seekFilter, filter, fade, master].filter(Boolean).join(',');
 
   if (fullFilter) {
     ffmpegArgs.push('-af', fullFilter);
   }
   ffmpegArgs.push('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
 
-  const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
   const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -1176,38 +1039,12 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
     console.error('ffmpeg stderr:', msg);
   });
 
-  ffmpeg.stderr.on('data', (d) => {
-    const msg = String(d || '').trim();
-    if (!msg) return;
-    if (msg.toLowerCase().includes('broken pipe')) return;
-    if (msg.toLowerCase().includes('conversion failed')) return;
-    // Artefatos normais de fechamento de stream ao trocar efeito/música
-    if (msg.includes('Error muxing a packet')) return;
-    if (msg.includes('Error writing trailer')) return;
-    if (msg.includes('Error closing file')) return;
-    if (msg.includes('Error submitting a packet to the muxer')) return;
-    console.error('ffmpeg stderr:', msg);
-  });
-
   if (ffmpeg.stdout && typeof ffmpeg.stdout.on === 'function') {
     ffmpeg.stdout.on('error', (err) => {
       if (isExpectedStreamCloseError(err)) return;
       console.error('❌ ffmpeg stdout erro:', err?.message || err);
     });
   }
-
-  ffmpeg.once('close', () => {
-    try {
-      if (ytdlp.stdout && ffmpeg.stdin) ytdlp.stdout.unpipe(ffmpeg.stdin);
-    } catch {}
-    killProcessSafe(ytdlp);
-  });
-
-  ytdlp.once('close', () => {
-    try {
-      if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) ffmpeg.stdin.end();
-    } catch {}
-  });
 
   ffmpeg.once('close', () => {
     try {
@@ -1304,7 +1141,6 @@ async function playNext(guildId) {
     if (data.advanceRequested) {
       data.advanceRequested = false;
       schedulePlayNext(guildId, 0);
-      schedulePlayNext(guildId, 0);
     }
   }
 }
@@ -1335,12 +1171,10 @@ async function addYouTube(message, url, title) {
   if (!isActive) {
     data.queue.push(song);
     refreshLoopPlaylistSnapshot(data);
-    refreshLoopPlaylistSnapshot(data);
     playNext(message.guildId);
     return null;
   } else {
     data.queue.push(song);
-    refreshLoopPlaylistSnapshot(data);
     refreshLoopPlaylistSnapshot(data);
     const position = data.queue.length;
     const sentMsg = await message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`).catch(() => null);
@@ -1377,8 +1211,6 @@ async function addPlaylist(message, videos, opts = {}) {
     }
     data.queue.push(video);
   }
-
-  refreshLoopPlaylistSnapshot(data);
 
   refreshLoopPlaylistSnapshot(data);
 
@@ -1610,7 +1442,6 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
   data.advanceInProgress = false;
   data.advanceRequested = false;
   clearScheduledTimers(data);
-  clearScheduledTimers(data);
   data.suppressNextIdleCount = 0;
   data.suppressNextErrorAdvanceCount = 0;
   data.navCooldownUntil = 0;
@@ -1716,12 +1547,9 @@ function cleanup(guildId) {
   data.history = [];
   data.loopPlaylist = false;
   data.playlistFull = [];
-  data.loopPlaylist = false;
-  data.playlistFull = [];
   data.musicPausedForSfx = false;
   data.advanceInProgress = false;
   data.advanceRequested = false;
-  clearScheduledTimers(data);
   clearScheduledTimers(data);
   data.suppressNextIdleCount = 0;
   data.suppressNextErrorAdvanceCount = 0;
@@ -1903,7 +1731,6 @@ module.exports = {
   leave,
   getQueue,
   getQueueFull,
-  getQueueFull,
   ensureConnection,
   jumpTo,
   getEffectList,
@@ -1917,9 +1744,6 @@ module.exports = {
   applyEffectNow,
   toggleLoop,
   getLoop,
-  toggleLoopPlaylist,
-  getLoopPlaylist,
-  restartPlaylist,
   toggleLoopPlaylist,
   getLoopPlaylist,
   restartPlaylist,
