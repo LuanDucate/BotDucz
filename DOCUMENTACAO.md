@@ -44,6 +44,9 @@ Tambem inclui:
 ### 4.1 Prefixo - reproducao
 
 - +i <texto|link-myinstants> (instant)
+  - Reaja com 🦆 para repetir o instant
+  - Reaja com 📢 para tocar mais alto uma unica vez (volume via bot.json → sfx.megaphoneVolume)
+  - Reaja com ⭐ para salvar/remover dos favoritos compartilhados com uma unica mensagem de status por instant equivalente no canal
 - +p <texto|link>
 - +p tocar <texto|link>
 - +p play <text|link>
@@ -137,14 +140,36 @@ Texto recomendado:
 - src/spotify.js: funcoes de extracao/normalizacao para Spotify
 - src/config.js: leitura e merge de configuracoes JSON com fallback
 - src/utils.js: download/fetch utilitarios
-- config/bot.json: presenca, UI, timeouts, prefixes padrao
+- config/bot.json: presenca, UI, timeouts, sfx (megaphoneVolume), prefixes padrao
 - config/sources.json: limites de YouTube/Spotify/SoundCloud e concorrencia
 - config/musicQueue.json: historico, cooldowns e parametros internos da fila
 - favorites.json: armazenamento de favoritos compartilhados
 
 ## 9. Historico de modificacoes (organizado por data)
 
-### v2.0.0 — 2026-03-19 (release atual)
+### v2.1.0 — 2026-03-20 (release atual)
+
+Fix e UX:
+- Fix: +skip apos +p agora funciona corretamente (await adicionado em todos os retornos async de handlePlayQuery)
+- UX: deferredSkipRequests agora armazena referencia da mensagem ⏳ e a remove ao disparar ou cancelar o skip
+- UX: mensagens "adicionada a fila" e "X faixas adicionadas" rastreadas em queueStatusMessages e limpas quando a fila esvazia
+- UX: mensagem "A fila esta vazia." rastreada em emptyQueueMessages e removida ao iniciar nova musica, novo +p ou novo +fila
+- UX: prefixos transientes incluem '📋 A fila esta vazia.' (limpeza no startup)
+- UX: feedback de favorito do mesmo instant e consolidado em uma unica mensagem dinamica por consulta equivalente no canal
+
+Novo recurso - Megafone nos instants:
+- Ordem das reacoes do +i ajustada para 🦆/📢/⭐ via setupSfxRepeat
+- Um clique: toca o instant com volume multiplicado (padrao 3.0x)
+- Apos uso: reacao e removida permanentemente da mensagem (megaphoneUsed flag)
+- Megafones 📢 antigos em mensagens de +i sao removidos no startup e no shutdown do bot
+- playSfx agora aceita volumeMultiplier (usa inlineVolume quando != 1.0)
+- Configuravel em config/bot.json → sfx.megaphoneVolume
+
+Documentacao:
+- README e DOCUMENTACAO atualizados
+- buildHelpEmbed() expandido com descricao das reacoes 🦆/📢/⭐ e do feedback dinamico de favoritos
+
+### v2.0.0 — 2026-03-19
 
 Release que consolida a evolucao completa do bot:
 - SoundCloud: faixas e playlists via yt-dlp streaming

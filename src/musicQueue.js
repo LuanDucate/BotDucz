@@ -16,6 +16,7 @@ const { APP_CONFIG } = require('./config');
 const MQ_CFG = APP_CONFIG.musicQueue;
 const EFFECT_APPLY_COOLDOWN_MS = 250;
 const PLAY_NEXT_ERROR_DELAY_MS = 100;
+const ADVANCE_SUPPRESSION_WINDOW_MS = 5000;
 
 // ============================================================
 // Estado por guild
@@ -30,6 +31,7 @@ function setOnSongChangedCallback(cb) {
 function getGuildData(guildId) {
   if (!guilds.has(guildId)) {
     guilds.set(guildId, {
+      guildId,
       connection: null,
       musicPlayer: null,
       sfxPlayer: null,
@@ -49,6 +51,8 @@ function getGuildData(guildId) {
       loop: false,
       loopPlaylist: false,
       playlistFull: [],
+      loopPlaylist: false,
+      playlistFull: [],
       history: [],
       sequenceCounter: 0,
       currentSequence: 0,
@@ -57,14 +61,20 @@ function getGuildData(guildId) {
       advanceRequested: false,
       suppressNextIdleCount: 0,
       suppressNextErrorAdvanceCount: 0,
+      suppressAdvanceUntil: 0,
       navCooldownUntil: 0,
+      effectApplyCooldownUntil: 0,
+      effectApplyTimer: null,
+      playNextTimer: null,
       effectApplyCooldownUntil: 0,
       effectApplyTimer: null,
       playNextTimer: null,
       externalMoveGraceUntil: 0,
     });
   }
-  return guilds.get(guildId);
+  const data = guilds.get(guildId);
+  if (!data.guildId) data.guildId = guildId;
+  return data;
 }
 
 function buildCanonicalPlaylist(data) {
@@ -107,8 +117,36 @@ function buildCanonicalPlaylist(data) {
   return uniq.map((s) => ({ ...s }));
 }
 
+function findSongIndexInList(list, target) {
+  if (!Array.isArray(list) || !target) return -1;
+  return list.findIndex((song) => {
+    if (!song) return false;
+    if (Number.isFinite(song.sequence) && Number.isFinite(target.sequence)) {
+      return song.sequence === target.sequence;
+    }
+    return song.url === target.url && song.title === target.title;
+  });
+}
+
+function trimHistoryIfNeeded(data) {
+  if (!data || data.loopPlaylist) return;
+  while (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) {
+    data.history.shift();
+  }
+}
+
+function getLoopPlaylistView(data) {
+  if (!data || !data.loopPlaylist) {
+    return { songs: [], currentIndex: -1 };
+  }
+
+  const songs = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+  const currentIndex = findSongIndexInList(songs, data.currentSong);
+  return { songs, currentIndex };
+}
+
 function refreshLoopPlaylistSnapshot(data) {
-  if (!data || !data.loopPlaylist) return;
+  if (!data) return;
   data.playlistFull = buildCanonicalPlaylist(data);
 }
 
@@ -197,6 +235,18 @@ function clearScheduledTimers(data) {
   }
 }
 
+function clearScheduledTimers(data) {
+  if (!data) return;
+  if (data.effectApplyTimer) {
+    clearTimeout(data.effectApplyTimer);
+    data.effectApplyTimer = null;
+  }
+  if (data.playNextTimer) {
+    clearTimeout(data.playNextTimer);
+    data.playNextTimer = null;
+  }
+}
+
 function cleanupOldStream(data, old) {
   if (!old) return;
   setTimeout(() => {
@@ -207,10 +257,13 @@ function cleanupOldStream(data, old) {
 }
 
 function buildNowPlayingContent(song, queueSize, effect, effectIntensity, currentSequence = 0) {
+function buildNowPlayingContent(song, queueSize, effect, effectIntensity, currentSequence = 0) {
   const sequenceMsg = currentSequence > 0 ? ` | #${currentSequence}` : '';
   const queueMsg = queueSize > 0 ? ` | ${queueSize} na fila` : '';
   const effectMsg = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
+  const effectMsg = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
   const linkRef = song?.url && song.url.startsWith('http') ? `\n🔗 ${song.url}` : '';
+  return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${effectMsg}${linkRef}`;
   return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${effectMsg}${linkRef}`;
 }
 
@@ -220,6 +273,7 @@ async function upsertNowPlayingMessage(guildId, opts = {}) {
   const forceResend = Boolean(opts?.forceResend);
 
   const payload = {
+    content: buildNowPlayingContent(data.currentSong, data.queue.length, data.effect, data.effectIntensity || 5, data.currentSequence || 0),
     content: buildNowPlayingContent(data.currentSong, data.queue.length, data.effect, data.effectIntensity || 5, data.currentSequence || 0),
     components: [buildMusicControlRow(guildId)],
   };
@@ -301,12 +355,14 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   const playerStatus = data.musicPlayer?.state?.status;
   const replacingActiveResource =
     Boolean(data.currentStream) &&
+    Boolean(data.currentStream) &&
     Boolean(data.currentSong) &&
     playerStatus &&
     playerStatus !== AudioPlayerStatus.Idle;
   if (replacingActiveResource) {
     data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
     data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+    data.suppressAdvanceUntil = Date.now() + ADVANCE_SUPPRESSION_WINDOW_MS;
   }
 
   data.currentSong = song;
@@ -406,6 +462,19 @@ function applyEffectNow(guildId) {
   }
   data.effectApplyCooldownUntil = now + EFFECT_APPLY_COOLDOWN_MS;
 
+  const now = Date.now();
+  if (now < (data.effectApplyCooldownUntil || 0)) {
+    if (!data.effectApplyTimer) {
+      const waitMs = Math.max(15, (data.effectApplyCooldownUntil || now) - now);
+      data.effectApplyTimer = setTimeout(() => {
+        data.effectApplyTimer = null;
+        applyEffectNow(guildId);
+      }, waitMs);
+    }
+    return true;
+  }
+  data.effectApplyCooldownUntil = now + EFFECT_APPLY_COOLDOWN_MS;
+
   // Pausa o player imediatamente para congelar o playbackDuration no ponto exato.
   // Isso dá uma leitura de posição precisa (mesmo princípio do SFX pause/unpause).
   // O player.play(newResource) mais abaixo retomará a reprodução automaticamente.
@@ -424,7 +493,10 @@ function applyEffectNow(guildId) {
   const baseOffsetMs = (data.currentSongOffsetSeconds || 0) * 1000;
   // Ajuste fino conservador para reduzir corte sem acumular drift em múltiplas trocas.
   const BASE_FINE_TUNE_BACK_MS = 220;
+  // Ajuste fino conservador para reduzir corte sem acumular drift em múltiplas trocas.
+  const BASE_FINE_TUNE_BACK_MS = 220;
   const EFFECT_FINE_TUNE_EXTRA_MS = {
+    nightcore: 90,
     nightcore: 90,
   };
   const extraBackMs = EFFECT_FINE_TUNE_EXTRA_MS[data.effect] || 0;
@@ -459,6 +531,16 @@ function schedulePlayNext(guildId, delayMs = 0) {
   }, Math.max(0, Number(delayMs) || 0));
 }
 
+function schedulePlayNext(guildId, delayMs = 0) {
+  const data = guilds.get(guildId);
+  if (!data) return;
+  if (data.playNextTimer) return;
+  data.playNextTimer = setTimeout(() => {
+    data.playNextTimer = null;
+    playNext(guildId).catch(() => {});
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 async function ensureConnection(message) {
   const voiceChannel = message.member?.voice?.channel;
   if (!voiceChannel) {
@@ -471,6 +553,7 @@ async function ensureConnection(message) {
   }
 
   const data = getGuildData(message.guildId);
+  data.guildId = message.guildId;
 
   const currentState = data.connection?.state?.status;
   const isReady = currentState === VoiceConnectionStatus.Ready;
@@ -513,8 +596,17 @@ async function ensureConnection(message) {
     data.musicPlayer = createAudioPlayer();
 
     data.musicPlayer.on(AudioPlayerStatus.Idle, () => {
+      if ((data.suppressAdvanceUntil || 0) > 0 && Date.now() > data.suppressAdvanceUntil) {
+        data.suppressNextIdleCount = 0;
+        data.suppressNextErrorAdvanceCount = 0;
+        data.suppressAdvanceUntil = 0;
+      }
+
       if ((data.suppressNextIdleCount || 0) > 0) {
         data.suppressNextIdleCount -= 1;
+        if ((data.suppressNextIdleCount || 0) <= 0 && (data.suppressNextErrorAdvanceCount || 0) <= 0) {
+          data.suppressAdvanceUntil = 0;
+        }
         return;
       }
 
@@ -530,24 +622,33 @@ async function ensureConnection(message) {
 
       if (data.loop && lastSong) {
         // Loop ativo: repete a mesma música sem avançar a fila
-        playSong(message.guildId, lastSong);
+        playSong(data.guildId, lastSong);
       } else {
         // Histórico para o botão ⏮️ voltar (limitado para não crescer sem fim)
         if (lastSong) {
           if (!Array.isArray(data.history)) data.history = [];
           data.history.push(lastSong);
-          if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+          trimHistoryIfNeeded(data);
         }
-        schedulePlayNext(message.guildId, 0);
+        schedulePlayNext(data.guildId, 0);
       }
     });
 
     data.musicPlayer.on('error', (error) => {
+      if ((data.suppressAdvanceUntil || 0) > 0 && Date.now() > data.suppressAdvanceUntil) {
+        data.suppressNextIdleCount = 0;
+        data.suppressNextErrorAdvanceCount = 0;
+        data.suppressAdvanceUntil = 0;
+      }
+
       if ((data.suppressNextErrorAdvanceCount || 0) > 0) {
         data.suppressNextErrorAdvanceCount -= 1;
         // Um recurso antigo emitiu Error em vez de Idle — consome também o idle counter
         // para evitar que suppressNextIdleCount acumule e suprima avanços de fila reais.
         if ((data.suppressNextIdleCount || 0) > 0) data.suppressNextIdleCount -= 1;
+        if ((data.suppressNextIdleCount || 0) <= 0 && (data.suppressNextErrorAdvanceCount || 0) <= 0) {
+          data.suppressAdvanceUntil = 0;
+        }
         console.warn('⚠️ Ignorando erro do recurso anterior durante troca manual.');
         return;
       }
@@ -557,7 +658,7 @@ async function ensureConnection(message) {
         cleanupCurrentStream(data);
         data.currentSong = null;
         data.currentSongOffsetSeconds = 0;
-        schedulePlayNext(message.guildId, PLAY_NEXT_ERROR_DELAY_MS);
+        schedulePlayNext(data.guildId, PLAY_NEXT_ERROR_DELAY_MS);
         return;
       }
 
@@ -565,7 +666,7 @@ async function ensureConnection(message) {
       cleanupCurrentStream(data);
       data.currentSong = null;
       data.currentSongOffsetSeconds = 0;
-      schedulePlayNext(message.guildId, 0);
+      schedulePlayNext(data.guildId, 0);
     });
   }
 
@@ -591,12 +692,14 @@ const VALID_EFFECTS = [
   'bassboost', 'nightcore', 'helium', 'slow', 'echo',
   'reverb', 'karaoke', '8d', 'distortion', 'vaporwave', 'tremolo',
   'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
+  'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'glitch', 'reverse', 'drunk', 'lag', '8bit',
 ];
 
 const INTENSITY_EFFECTS = [
   'bassboost', 'nightcore', 'helium', 'slow', 'echo',
   'reverb', '8d', 'distortion', 'vaporwave', 'tremolo',
+  'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'chipmunk', 'alvin', 'giant', 'robot', 'radio', 'telefone',
   'glitch', 'reverse', 'drunk', 'lag', '8bit',
 ];
@@ -615,7 +718,9 @@ const EFFECT_DESCRIPTIONS = {
   tremolo: 'Oscila o volume rapidamente, criando pulsacao.',
   chipmunk: 'Pitch alto estilo desenho animado.',
   alvin: 'Esquilo dos filmes — voz bem aguda e acelerada estilo Alvin e os Esquilos!',
+  alvin: 'Esquilo dos filmes — voz bem aguda e acelerada estilo Alvin e os Esquilos!',
   giant: 'Pitch grave e pesado, estilo gigante.',
+  robot: 'Robot metalico pesado com foco de voz (estilo sintetico agressivo).',
   robot: 'Robot metalico pesado com foco de voz (estilo sintetico agressivo).',
   radio: 'Som de radio velho, limitado e chiado.',
   telefone: 'Faixa de telefone (300Hz-3400Hz).',
@@ -638,6 +743,65 @@ function tieredIntensityT(level) {
   if (l <= 3) return lerp(0.00, 0.28, (l - 1) / 2);
   if (l <= 7) return lerp(0.35, 0.72, (l - 4) / 3);
   return lerp(0.80, 1.00, (l - 8) / 2);
+}
+
+function buildRobotVoiceFilter(intensity = 5) {
+  const t = tieredIntensityT(intensity);
+  // Filtro estilo Blitzcrank: ring-mod agressivo, crusher pesado, ressonância metálica.
+  const hp = Math.round(lerp(180, 320, t));
+  const lp = Math.round(lerp(4800, 3000, t));
+  const lowCut = lerp(-5.0, -11.0, t).toFixed(1);
+  const metalPeak = lerp(2.0, 8.0, t).toFixed(1);    // ressonância de caixa metálica ~800 Hz
+  const presence1 = lerp(4.0, 12.0, t).toFixed(1);   // presença de voz ~1200 Hz
+  const presence2 = lerp(3.0, 8.0, t).toFixed(1);    // ar / inteligibilidade ~2500 Hz
+  const ringFreq = lerp(65.0, 160.0, t).toFixed(1);  // ring-mod mais alto e agressivo
+  const ringDepth = lerp(0.58, 0.99, t).toFixed(2);  // profundidade quase total no máximo
+  const crusherBits = Math.round(lerp(8, 4, t));      // crusher mais destrutivo
+  const crusherIn = lerp(1.20, 2.30, t).toFixed(2);  // overdrive maior na entrada
+  const robotRate = Math.round(lerp(22050, 8000, t)); // downsampling mais agressivo
+  const metalDelay = Math.round(lerp(8, 20, t));
+  const metalDecay = lerp(0.12, 0.32, t).toFixed(2);
+  const makeup = lerp(1.22, 1.90, t).toFixed(2);
+
+  return [
+    // Foca mais no centro (voz) — proporção levemente maior.
+    'pan=stereo|c0=0.65*FL+0.35*FR|c1=0.65*FR+0.35*FL',
+    `highpass=f=${hp}`,
+    `lowpass=f=${lp}`,
+    `equalizer=f=260:t=q:w=1.1:g=${lowCut}`,
+    `equalizer=f=800:t=q:w=0.8:g=${metalPeak}`,
+    `equalizer=f=1200:t=q:w=1.2:g=${presence1}`,
+    `equalizer=f=2500:t=q:w=1.0:g=${presence2}`,
+    `tremolo=f=${ringFreq}:d=${ringDepth}`,
+    `acrusher=level_in=${crusherIn}:level_out=1:bits=${crusherBits}:mode=log`,
+    `aresample=${robotRate}`,
+    'aresample=48000',
+    `aecho=0.80:0.44:${metalDelay}:${metalDecay}`,
+    'compand=attacks=0.001:decays=0.06:points=-90/-90|-40/-30|-24/-14|-10/-4|0/-1.5',
+    `volume=${makeup}`,
+    'alimiter=limit=0.94:level=disabled',
+  ].join(',');
+}
+
+function buildAlvinFilter(intensity = 5) {
+  const t = tieredIntensityT(intensity);
+  // Alvin e os Esquilos: pitch ~+7 a +12 semitons, levemente acelerado (fiel aos filmes).
+  // +7 semi = 2^(7/12) ≈ 1.498 | +12 semi = 2^(12/12) = 2.000
+  const rate = lerp(1.50, 2.00, t).toFixed(4);
+  // Não corrige totalmente o tempo — fica levemente mais rápido (estilo filme).
+  const tempo = lerp(0.94, 0.72, t).toFixed(3);
+  const treble = lerp(3.5, 8.0, t).toFixed(1);        // brilho característico do esquilo
+  const presence = lerp(2.5, 6.5, t).toFixed(1);     // clareza da voz aguda
+  const compMakeup = lerp(1.5, 3.5, t).toFixed(1);   // punch para deixar a voz "no ar"
+
+  return [
+    `asetrate=44100*${rate}`,
+    'aresample=44100',
+    `atempo=${tempo}`,
+    `treble=g=${treble}`,
+    `equalizer=f=3000:t=q:w=1.0:g=${presence}`,
+    `acompressor=threshold=-20dB:ratio=3:attack=5:release=60:makeup=${compMakeup}`,
+  ].join(',');
 }
 
 function buildRobotVoiceFilter(intensity = 5) {
@@ -796,12 +960,16 @@ function buildEffectFilter(effect, intensity = 5) {
     }
     case 'alvin':
       return buildAlvinFilter(intensity);
+    case 'alvin':
+      return buildAlvinFilter(intensity);
     case 'giant': {
       const rate = lerp(0.95, 0.56, t).toFixed(4);
       const tempo = lerp(0.99, 0.83, t).toFixed(3);
       const bass = lerp(1.5, 8.0, t).toFixed(1);
       return `asetrate=44100*${rate},aresample=44100,atempo=${tempo},equalizer=f=110:t=q:w=1.2:g=${bass}`;
     }
+    case 'robot':
+      return buildRobotVoiceFilter(intensity);
     case 'robot':
       return buildRobotVoiceFilter(intensity);
     case 'radio': {
@@ -895,15 +1063,30 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
     ].join(',');
   };
 
+
+  const buildMasterPostFilter = () => {
+    // Cadeia final leve para segurar picos e manter consistência sem custo alto.
+    return [
+      'acompressor=threshold=-17dB:ratio=2.2:attack=5:release=140:makeup=1.16',
+      'volume=1.08',
+      'alimiter=limit=0.98:level=disabled',
+    ].join(',');
+  };
+
   const ytdlp = spawn('yt-dlp', [
     '-f', 'bestaudio/best',
     '-o', '-',
     '--quiet',
     '--no-warnings',
     '--no-progress',
+    '--no-progress',
     '--no-playlist',
     '--extractor-args', 'youtube:player_client=android',
     url,
+  ], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -956,12 +1139,19 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
   const fade = smoothSwitch ? 'afade=t=in:st=0:d=0.06' : null;
   const master = buildMasterPostFilter();
   const fullFilter = [seekFilter, filter, fade, master].filter(Boolean).join(',');
+  const fade = smoothSwitch ? 'afade=t=in:st=0:d=0.06' : null;
+  const master = buildMasterPostFilter();
+  const fullFilter = [seekFilter, filter, fade, master].filter(Boolean).join(',');
 
   if (fullFilter) {
     ffmpegArgs.push('-af', fullFilter);
   }
   ffmpegArgs.push('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
 
+  const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
   const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -986,12 +1176,38 @@ function createFilteredStream(url, effect, intensity = 5, seekSeconds = 0, smoot
     console.error('ffmpeg stderr:', msg);
   });
 
+  ffmpeg.stderr.on('data', (d) => {
+    const msg = String(d || '').trim();
+    if (!msg) return;
+    if (msg.toLowerCase().includes('broken pipe')) return;
+    if (msg.toLowerCase().includes('conversion failed')) return;
+    // Artefatos normais de fechamento de stream ao trocar efeito/música
+    if (msg.includes('Error muxing a packet')) return;
+    if (msg.includes('Error writing trailer')) return;
+    if (msg.includes('Error closing file')) return;
+    if (msg.includes('Error submitting a packet to the muxer')) return;
+    console.error('ffmpeg stderr:', msg);
+  });
+
   if (ffmpeg.stdout && typeof ffmpeg.stdout.on === 'function') {
     ffmpeg.stdout.on('error', (err) => {
       if (isExpectedStreamCloseError(err)) return;
       console.error('❌ ffmpeg stdout erro:', err?.message || err);
     });
   }
+
+  ffmpeg.once('close', () => {
+    try {
+      if (ytdlp.stdout && ffmpeg.stdin) ytdlp.stdout.unpipe(ffmpeg.stdin);
+    } catch {}
+    killProcessSafe(ytdlp);
+  });
+
+  ytdlp.once('close', () => {
+    try {
+      if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) ffmpeg.stdin.end();
+    } catch {}
+  });
 
   ffmpeg.once('close', () => {
     try {
@@ -1028,7 +1244,7 @@ async function playNext(guildId) {
   data.advanceInProgress = true;
   try {
     if (data.queue.length === 0) {
-      if (data.loopPlaylist && !data.loop) {
+      if (data.loopPlaylist) {
         // Loop de playlist: reabastece a fila do início usando snapshot canônico.
         const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
         if (full.length === 0) {
@@ -1074,7 +1290,7 @@ async function playNext(guildId) {
       cleanupCurrentStream(data);
       if (data.queue.length > 0) {
         schedulePlayNext(guildId, PLAY_NEXT_ERROR_DELAY_MS);
-      } else if (data.loopPlaylist && !data.loop) {
+      } else if (data.loopPlaylist) {
         const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
         if (full.length === 0) return;
         data.playlistFull = full.map((s) => ({ ...s }));
@@ -1088,6 +1304,7 @@ async function playNext(guildId) {
     if (data.advanceRequested) {
       data.advanceRequested = false;
       schedulePlayNext(guildId, 0);
+      schedulePlayNext(guildId, 0);
     }
   }
 }
@@ -1097,6 +1314,11 @@ async function playNext(guildId) {
  */
 async function addYouTube(message, url, title) {
   const data = await ensureConnection(message);
+  const startingFreshSession = !data.currentSong && data.queue.length === 0;
+  if (startingFreshSession) {
+    data.history = [];
+    data.playlistFull = [];
+  }
   const song = { url, title: title || 'vídeo do YouTube' };
   if (!Number.isFinite(song.sequence)) {
     data.sequenceCounter = (data.sequenceCounter || 0) + 1;
@@ -1113,13 +1335,17 @@ async function addYouTube(message, url, title) {
   if (!isActive) {
     data.queue.push(song);
     refreshLoopPlaylistSnapshot(data);
+    refreshLoopPlaylistSnapshot(data);
     playNext(message.guildId);
+    return null;
   } else {
     data.queue.push(song);
     refreshLoopPlaylistSnapshot(data);
+    refreshLoopPlaylistSnapshot(data);
     const position = data.queue.length;
-    message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`);
+    const sentMsg = await message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`).catch(() => null);
     await refreshNowPlayingMessage(message.guildId).catch(() => {});
+    return sentMsg;
   }
 }
 
@@ -1131,6 +1357,11 @@ async function addYouTube(message, url, title) {
  */
 async function addPlaylist(message, videos, opts = {}) {
   const data = await ensureConnection(message);
+  const startingFreshSession = !data.currentSong && data.queue.length === 0;
+  if (startingFreshSession) {
+    data.history = [];
+    data.playlistFull = [];
+  }
 
   // CRITICAL: isActive deve considerar Buffering também, senão playNext() é chamado prematuramente!
   const isActive =
@@ -1146,6 +1377,8 @@ async function addPlaylist(message, videos, opts = {}) {
     }
     data.queue.push(video);
   }
+
+  refreshLoopPlaylistSnapshot(data);
 
   refreshLoopPlaylistSnapshot(data);
 
@@ -1186,7 +1419,7 @@ async function addPlaylist(message, videos, opts = {}) {
  * Se há música tocando, pausa ela brevemente, toca o SFX,
  * e depois retoma a música.
  */
-async function playSfx(message, tmpFile, displayName) {
+async function playSfx(message, tmpFile, displayName, volumeMultiplier = 1.0) {
   const data = await ensureConnection(message);
   const requesterId = message.author?.id || '0';
   const sfxToken = (data.sfxPlaybackToken || 0) + 1;
@@ -1204,7 +1437,12 @@ async function playSfx(message, tmpFile, displayName) {
   // Inscrever sfx player na conexão
   data.connection.subscribe(data.sfxPlayer);
 
-  const resource = createAudioResource(tmpFile);
+  const effectiveVol = Number.isFinite(Number(volumeMultiplier)) ? Number(volumeMultiplier) : 1.0;
+  const useInlineVolume = Math.abs(effectiveVol - 1.0) > 0.001;
+  const resource = useInlineVolume
+    ? createAudioResource(tmpFile, { inlineVolume: true })
+    : createAudioResource(tmpFile);
+  if (useInlineVolume) resource.volume.setVolume(effectiveVol);
   data.sfxPlayer.play(resource);
 
   // Mensagem temporária para não poluir o chat
@@ -1317,10 +1555,9 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
 
   // Add current song to history before advancing
   if (!Array.isArray(data.history)) data.history = [];
-  const skipped = data.currentSong.title;
   if (data.currentSong) {
     data.history.push(data.currentSong);
-    if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+    trimHistoryIfNeeded(data);
   }
 
   // Get next song WITHOUT revealing it yet
@@ -1334,13 +1571,20 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
   
   // Update UI and notify
   await refreshNowPlayingMessage(message.guildId).catch(() => {});
-  await replyFn(`⏭️ Pulando: **${skipped}**`);
 }
 
 
 async function stop(message, replyFn = (text) => message.reply(text)) {
   const data = guilds.get(message.guildId);
-  if (!data || (!data.currentSong && data.queue.length === 0)) {
+  if (!data) {
+    await replyFn('❌ Nenhum áudio está tocando no momento.');
+    return;
+  }
+
+  const hasActiveAudioOrQueue = Boolean(data.currentSong) || data.queue.length > 0;
+  const hasAnyLoopEnabled = Boolean(data.loop) || Boolean(data.loopPlaylist);
+
+  if (!hasActiveAudioOrQueue && !hasAnyLoopEnabled) {
     await replyFn('❌ Nenhum áudio está tocando no momento.');
     return;
   }
@@ -1359,18 +1603,19 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
   data.currentSequence = 0;
   data.sequenceCounter = 0;
   data.history = [];
+  data.loop = false;
   data.loopPlaylist = false;
   data.playlistFull = [];
   data.musicPausedForSfx = false;
   data.advanceInProgress = false;
   data.advanceRequested = false;
   clearScheduledTimers(data);
+  clearScheduledTimers(data);
   data.suppressNextIdleCount = 0;
   data.suppressNextErrorAdvanceCount = 0;
   data.navCooldownUntil = 0;
   if (data.musicPlayer) data.musicPlayer.stop();
   if (data.sfxPlayer) data.sfxPlayer.stop();
-  await replyFn('⏹️ Áudio parado e fila limpa!');
 }
 
 function leave(message) {
@@ -1471,9 +1716,12 @@ function cleanup(guildId) {
   data.history = [];
   data.loopPlaylist = false;
   data.playlistFull = [];
+  data.loopPlaylist = false;
+  data.playlistFull = [];
   data.musicPausedForSfx = false;
   data.advanceInProgress = false;
   data.advanceRequested = false;
+  clearScheduledTimers(data);
   clearScheduledTimers(data);
   data.suppressNextIdleCount = 0;
   data.suppressNextErrorAdvanceCount = 0;
@@ -1502,6 +1750,25 @@ async function jumpTo(guildId, position) {
   const data = guilds.get(guildId);
   if (!data) return false;
 
+  if (data.loopPlaylist) {
+    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+    const idx = Math.floor(position) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= full.length) return false;
+
+    const targetSong = full[idx];
+    if (!targetSong) return false;
+
+    data.playlistFull = full.map((song) => ({ ...song }));
+    data.history = full.slice(0, idx).map((song) => ({ ...song }));
+    data.queue = full.slice(idx + 1).map((song) => ({ ...song }));
+
+    await ensurePlayableSong(targetSong).catch(() => {});
+    playSong(guildId, { ...targetSong }, 0, true);
+    await refreshNowPlayingMessage(guildId).catch(() => {});
+
+    return true;
+  }
+
   // Position is 1-based index into the queue (not including the current song)
   const idx = Math.floor(position) - 1;
   if (isNaN(idx) || idx < 0 || idx >= data.queue.length) return false;
@@ -1515,7 +1782,7 @@ async function jumpTo(guildId, position) {
 
   if (data.currentSong) data.history.push(data.currentSong);
   if (skippedBeforeTarget.length > 0) data.history.push(...skippedBeforeTarget);
-  while (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+  trimHistoryIfNeeded(data);
 
   await ensurePlayableSong(targetSong).catch(() => {});
   playSong(guildId, targetSong, 0, true);
@@ -1545,19 +1812,7 @@ function toggleLoopPlaylist(guildId) {
   if (data.loopPlaylist) {
     // Snapshot canônico por ordem original (sequence), robusto para jump/skip durante carregamento.
     data.playlistFull = buildCanonicalPlaylist(data);
-    const current = data.currentSong;
-    let currentIndex = 0;
-    if (current) {
-      const idx = data.playlistFull.findIndex((song) => {
-        if (!song) return false;
-        // Preferência por sequence; fallback por url+title.
-        if (Number.isFinite(song.sequence) && Number.isFinite(current.sequence)) {
-          return song.sequence === current.sequence;
-        }
-        return song.url === current.url && song.title === current.title;
-      });
-      if (idx >= 0) currentIndex = idx;
-    }
+    const currentIndex = Math.max(0, findSongIndexInList(data.playlistFull, data.currentSong));
     return { enabled: true, currentIndex, total: data.playlistFull.length };
   } else {
     data.playlistFull = [];
@@ -1572,11 +1827,14 @@ function getLoopPlaylist(guildId) {
 function getQueueFull(guildId) {
   const data = guilds.get(guildId);
   if (!data) return { current: null, queue: [], history: [], loopPlaylist: false, effect: null, effectIntensity: 5 };
+  const loopView = getLoopPlaylistView(data);
   return {
     current: data.currentSong,
     queue: [...data.queue],
     history: [...(data.history || [])],
     loopPlaylist: data.loopPlaylist || false,
+    playlistSongs: loopView.songs,
+    currentIndex: loopView.currentIndex,
     effect: data.effect,
     effectIntensity: data.effectIntensity || 5,
   };
@@ -1645,6 +1903,7 @@ module.exports = {
   leave,
   getQueue,
   getQueueFull,
+  getQueueFull,
   ensureConnection,
   jumpTo,
   getEffectList,
@@ -1658,6 +1917,9 @@ module.exports = {
   applyEffectNow,
   toggleLoop,
   getLoop,
+  toggleLoopPlaylist,
+  getLoopPlaylist,
+  restartPlaylist,
   toggleLoopPlaylist,
   getLoopPlaylist,
   restartPlaylist,
