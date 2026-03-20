@@ -25,8 +25,13 @@
       "+d",
       "+p",
       "+play",
+      "+tocar",
       "+skip",
+      "+pular",
       "+stop",
+      "+parar",
+      "+sair",
+      "+leave",
       "+i",
       "+fav",
       "+efeito",
@@ -36,7 +41,9 @@
       "+fila",
       "+queue",
       "+clear",
-      "+help"
+      "+help",
+      "+ajuda",
+      "+prefix"
     ]
   }
 }

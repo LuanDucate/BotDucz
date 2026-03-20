@@ -9,7 +9,7 @@ Bot de Discord para reproduzir audio em canal de voz com suporte a:
 ## Resumo rapido do que o bot faz
 
 - Toca instant de MyInstants com comando rapido (+i)
-- Toca musicas por busca ou link (+d, +play)
+- Toca musicas por busca ou link com foco em +p (play/tocar)
 - Mantem fila de reproducao com navegacao por botoes
 - Permite pular, parar, sair e ir para item especifico da fila
 - Aplica efeitos de audio com intensidade (+efeito e +ef)
@@ -85,31 +85,36 @@ npm start
 
 ## Prefixos principais
 
-- +d
-- +Ducz
+- +p (principal para musica)
 - +play
 - +i
+- +stop
+- +skip
 - +fav
 - +fila
 - +ef
 - +help
 
+Aliases legados ainda aceitos: +d e +Ducz.
+
 ## Comandos por prefixo
 
 ### Reproducao
 
-- +i <texto|link-myinstants>
-- +d <texto|link-youtube|link-soundcloud|link-spotify>
-- +play <texto|link-youtube|link-soundcloud|link-spotify>
+- +i <texto|link-myinstants> (instant)
+- +p <texto|link-youtube|link-soundcloud|link-spotify>
+- +p tocar <texto|link>
+- +p play <text|link>
 
 ### Controle de fila
 
-- +d skip
 - +skip
-- +d parar
 - +stop
-- +d sair
+- +pular
+- +parar
+- +sair / +leave
 - +fila
+- +queue
 - +fila <numero>
 
 ### Efeitos
@@ -132,11 +137,11 @@ npm start
 ### Utilitarios
 
 - +help
-- +d ajuda
-- +d prefix
-- +d prefix add <valor>
-- +d prefix remove <valor>
-- +d prefix reset
+- +ajuda
+- +prefix
+- +prefix <valor>
+- +prefix set <valor>
+- +prefix reset
 - +clear <1m|2h|1d>
 - +killbot (apenas dono)
 
@@ -148,7 +153,7 @@ npm start
 - /skip
 - /stop
 - /effect acao:<ativar|off|status|lista> [nome] [intensidade]
-- /prefix acao:<view|add|remove|reset> [valor]
+- /prefix acao:<view|set|reset> [valor]
 - /leave
 - /help
 - /killbot
