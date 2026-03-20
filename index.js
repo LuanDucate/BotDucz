@@ -50,6 +50,7 @@ const {
   stop,
   leave,
   getQueue,
+  getQueueFull,
   jumpTo,
   getEffectList,
   getIntensityEffectList,
@@ -67,7 +68,7 @@ const {
   setOnSongChangedCallback,
   leaveSilently,
 } = require('./src/musicQueue');
-const { toggleLoop, getLoop, playPrevious, buildMusicControlRow } = require('./src/musicQueue');
+const { toggleLoop, getLoop, toggleLoopPlaylist, getLoopPlaylist, restartPlaylist, playPrevious, buildMusicControlRow } = require('./src/musicQueue');
 
 // Evita rodar duas instâncias na mesma máquina (cria um lock file)
 const lockFilePath = path.join(__dirname, 'bot.lock');
@@ -75,6 +76,7 @@ const BOT_VERSION = '2.0.0';
 const BOT_BUILD_TAG = `v${BOT_VERSION}`;
 const BOT_CFG = APP_CONFIG.bot;
 const SOURCES_CFG = APP_CONFIG.sources;
+let presenceHelpCommandHint = '+help';
 
 function isProcessRunning(pid) {
   try {
@@ -406,8 +408,10 @@ function updateBotPresence(songTitle = null) {
   if (!client.user) return;
 
   const title = String(songTitle || '').trim();
-  const suffix = String(BOT_CFG.presence?.playingSuffix || '| +help');
-  const idleText = String(BOT_CFG.presence?.idleText || '+help');
+  const rawSuffix = String(BOT_CFG.presence?.playingSuffix || '| +help');
+  const suffix = rawSuffix.includes('help') ? `| ${presenceHelpCommandHint}` : rawSuffix;
+  const rawIdleText = String(BOT_CFG.presence?.idleText || '+help');
+  const idleText = rawIdleText.includes('help') ? presenceHelpCommandHint : rawIdleText;
   const maxActivityLength = Number(BOT_CFG.presence?.maxActivityLength) || 128;
   const presenceStatus = String(BOT_CFG.presence?.status || 'online');
   const activityName = title ? `${title} ${suffix}`.slice(0, maxActivityLength) : idleText;
@@ -415,6 +419,15 @@ function updateBotPresence(songTitle = null) {
     activities: [{ name: activityName, type: 2 }],
     status: presenceStatus,
   });
+}
+
+function normalizePrefixForDisplay(prefix) {
+  const p = String(prefix || '').trim();
+  return p || '+p';
+}
+
+function updatePresenceHelpHint(guildId = null, fallbackPrefix = null) {
+  presenceHelpCommandHint = '+help';
 }
 
 function enqueueSoundCloudTrackResolve(guildId, track) {
@@ -476,6 +489,10 @@ function clearSpotifyLoadSession(guildId, token = null) {
   spotifyLoadSessions.delete(guildId);
 }
 
+function isPlaylistLoadInProgress(guildId) {
+  return spotifyLoadSessions.has(guildId);
+}
+
 async function resolveQueriesToVideos(queries, { maxItems = 30, concurrency = 5 } = {}) {
   const effectiveMaxItems = Number(maxItems) || Number(SOURCES_CFG.resolution?.maxItems) || 30;
   const effectiveConcurrency = Number(concurrency) || Number(SOURCES_CFG.resolution?.concurrency) || 5;
@@ -517,7 +534,7 @@ const client = new Client({
 // Prefixos padrão (inclui +p, +play, +skip, +stop, +i, +efeito/+ef e +fila/+queue)
 const DEFAULT_PREFIXES = Array.isArray(BOT_CFG.commands?.defaultPrefixes)
   ? BOT_CFG.commands.defaultPrefixes
-  : ['+Ducz', '+d', '+p', '+play', '+skip', '+stop', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help'];
+  : ['+Ducz', '+d', '+p', '+play', '+tocar', '+skip', '+pular', '+stop', '+parar', '+sair', '+leave', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help', '+ajuda', '+prefix'];
 
 // IDs de usuário (Discord) autorizados a usar +killbot
 // Adicione aqui outros IDs separados por vírgula, se quiser.
@@ -736,6 +753,10 @@ const pendingQueueMessages = new Map();
 // Chave: mensagem do bot
 // Valor: { userId, timeoutId }
 const pendingEffectMessages = new Map();
+// Confirmação de efeito ativo por guild (1 por guild, expira em 10s)
+const guildEffectConfirmMsgs = new Map();
+// Erro de efeito desconhecido por guild (1 por guild, expira em 15s)
+const guildEffectErrorMsgs = new Map();
 // Mensagem de help exibida com botão de fechar
 // Chave: mensagem do bot
 // Valor: { userId, timeoutId }
@@ -901,7 +922,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
     }
   }
 
-  const { current, queue } = getQueue(message.guildId);
+  const { current, queue, history, loopPlaylist, effect, effectIntensity } = getQueueFull(message.guildId);
   if (!current && queue.length === 0) {
     if (existingMessage && existingEntry) {
       pendingQueueMessages.delete(existingMessage.id);
@@ -911,21 +932,48 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
     return message.reply('📋 A fila está vazia.');
   }
 
+  // Monta lista de exibição: modo normal (só fila) ou modo loop-playlist (histórico + atual + fila)
+  const allSongs = loopPlaylist
+    ? [...history, ...(current ? [current] : []), ...queue]
+    : queue;
+  const currentIdx = loopPlaylist ? history.length : -1;
+  const displayTotal = loopPlaylist ? allSongs.length : queue.length;
+
   const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
-  const totalPages = Math.max(1, Math.ceil(queue.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(displayTotal / pageSize));
   const normalizedPage = Math.min(Math.max(0, page), totalPages - 1);
+  const effectLabel = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
 
   let text = '';
-  if (current) text += `🎶 **Tocando agora:** ${current.title}\n\n`;
-  if (queue.length > 0) {
-    text += `📋 **Fila (${queue.length}):**\n`;
+  if (loopPlaylist) {
+    text += `🔄 **Playlist em loop (${allSongs.length} músicas)${effectLabel}**`;
+    if (totalPages > 1) text += ` — pág. ${normalizedPage + 1}/${totalPages}`;
+    text += '\n\n';
     const start = normalizedPage * pageSize;
-    const pageItems = queue.slice(start, start + pageSize);
+    const pageItems = allSongs.slice(start, start + pageSize);
     pageItems.forEach((song, i) => {
-      text += `**${start + i + 1}.** ${song.title}\n`;
+      const gidx = start + i;
+      if (gidx === currentIdx) {
+        text += `▶️ **${gidx + 1}. ${song.title}** ← tocando\n`;
+      } else {
+        text += `**${gidx + 1}.** ${song.title}\n`;
+      }
     });
-    if (queue.length > start + pageSize) {
-      text += `\n...e mais ${queue.length - (start + pageSize)} música(s)`;
+    if (allSongs.length > start + pageSize) {
+      text += `\n...e mais ${allSongs.length - (start + pageSize)} música(s)`;
+    }
+  } else {
+    if (current) text += `🎶 **Tocando agora:** ${current.title}${effectLabel}\n\n`;
+    if (queue.length > 0) {
+      text += `📋 **Fila (${queue.length}):**\n`;
+      const start = normalizedPage * pageSize;
+      const pageItems = queue.slice(start, start + pageSize);
+      pageItems.forEach((song, i) => {
+        text += `**${start + i + 1}.** ${song.title}\n`;
+      });
+      if (queue.length > start + pageSize) {
+        text += `\n...e mais ${queue.length - (start + pageSize)} música(s)`;
+      }
     }
   }
 
@@ -937,16 +985,16 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`queue_prev_${requesterId}_${normalizedPage - 1}`)
-        .setLabel('Anterior')
+        .setLabel('◀ Anterior')
         .setStyle(ButtonStyle.Primary)
     );
   }
 
-  if (queue.length > (normalizedPage + 1) * pageSize) {
+  if (displayTotal > (normalizedPage + 1) * pageSize) {
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`queue_next_${requesterId}_${normalizedPage + 1}`)
-        .setLabel('Próxima')
+        .setLabel('Próxima ▶')
         .setStyle(ButtonStyle.Primary)
     );
   }
@@ -968,6 +1016,24 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
   );
 
   components.push(row);
+
+  // Segunda linha: controles de playlist
+  if (current || queue.length > 0) {
+    const row2 = new ActionRowBuilder();
+    row2.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`queue_loopplaylist_${requesterId}`)
+        .setLabel('Loop Playlist')
+        .setEmoji('🔄')
+        .setStyle(loopPlaylist ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`queue_restart_${requesterId}`)
+        .setLabel('Reiniciar')
+        .setEmoji('⏮️')
+        .setStyle(ButtonStyle.Primary),
+    );
+    components.push(row2);
+  }
 
   const signature = `${normalizedPage}|${current?.title || ''}|${queue.length}|${text}`;
   if (existingMessage && existingEntry?.lastSignature === signature) {
@@ -1020,6 +1086,46 @@ async function sendDismissableEffectMessage(message, content) {
   return sent;
 }
 
+// Envia confirmação de efeito com 1 msg por guild (substitui a anterior) que expira em 10s
+async function sendTimedEffectConfirm(message, guildId, text) {
+  const prev = guildEffectConfirmMsgs.get(guildId);
+  if (prev) {
+    clearTimeout(prev.timeoutId);
+    prev.msg.delete().catch(() => {});
+    guildEffectConfirmMsgs.delete(guildId);
+  }
+  const sent = await message.reply(text).catch(() => null);
+  if (!sent) return null;
+  const timeoutId = setTimeout(() => {
+    guildEffectConfirmMsgs.delete(guildId);
+    sent.delete().catch(() => {});
+  }, 10_000);
+  guildEffectConfirmMsgs.set(guildId, { msg: sent, timeoutId });
+  return sent;
+}
+
+function clearEffectErrorMessage(guildId) {
+  const prev = guildEffectErrorMsgs.get(guildId);
+  if (prev) {
+    clearTimeout(prev.timeoutId);
+    prev.msg.delete().catch(() => {});
+    guildEffectErrorMsgs.delete(guildId);
+  }
+}
+
+// Envia mensagem de erro de efeito com 1 msg por guild que expira em 15s
+async function sendTimedEffectError(message, guildId, text) {
+  clearEffectErrorMessage(guildId);
+  const sent = await message.reply(text).catch(() => null);
+  if (!sent) return null;
+  const timeoutId = setTimeout(() => {
+    guildEffectErrorMsgs.delete(guildId);
+    sent.delete().catch(() => {});
+  }, 15_000);
+  guildEffectErrorMsgs.set(guildId, { msg: sent, timeoutId });
+  return sent;
+}
+
 async function sendDismissableHelpMessage(message) {
   const requesterId = message?.author?.id || message?.user?.id || '0';
   const row = new ActionRowBuilder().addComponents(
@@ -1060,6 +1166,10 @@ function startQueueLiveRefresh() {
 }
 
 async function jumpToQueue(message, position) {
+  if (isPlaylistLoadInProgress(message.guildId)) {
+    return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para usar `+fila <n>` / Tocar (#).');
+  }
+
   const { queue } = getQueue(message.guildId);
   if (!queue.length) {
     return message.reply('❌ A fila está vazia. Use `+fila` para ver as músicas.');
@@ -1075,16 +1185,30 @@ async function jumpToQueue(message, position) {
   if (!success) {
     return message.reply('❌ Número inválido ou fila vazia. Use `+fila` para ver as músicas.');
   }
-  await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+  await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
   return message.reply(`▶️ Indo para a música #${position} da fila...`);
 }
 
-async function refreshQueueMessagesForGuild(guildId) {
+function getCurrentSongQueuePage(guildId) {
+  const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
+  const { history, loopPlaylist } = getQueueFull(guildId);
+  if (!loopPlaylist) return 0;
+  return Math.max(0, Math.floor((history?.length || 0) / pageSize));
+}
+
+async function refreshQueueMessagesForGuild(guildId, opts = {}) {
+  const forceCurrentSongPage = Boolean(opts?.forceCurrentSongPage);
+  const targetPage = forceCurrentSongPage ? getCurrentSongQueuePage(guildId) : null;
   const tasks = [];
   for (const [messageId, entry] of pendingQueueMessages.entries()) {
     if (!entry?.message || entry.message.guildId !== guildId) continue;
+    const nextPage = targetPage !== null ? targetPage : (entry.page || 0);
+    if (targetPage !== null) {
+      entry.page = targetPage;
+      pendingQueueMessages.set(messageId, entry);
+    }
     tasks.push(
-      showQueueMessage(entry.message, entry.page || 0, entry.message).catch(() => {
+      showQueueMessage(entry.message, nextPage, entry.message).catch(() => {
         if (entry.timeoutId) clearTimeout(entry.timeoutId);
         pendingQueueMessages.delete(messageId);
       })
@@ -1206,45 +1330,52 @@ function buildHelpEmbed() {
     .setColor(0x5865f2)
     .setTitle('🎵 BotDucz — +help')
     .setDescription(
-      'Central de ajuda do BotDucz: reproduza áudio de **MyInstants, YouTube, SoundCloud e Spotify** com fila, efeitos e atalhos.'
+      'Central de ajuda do BotDucz: use **+p**, **+play** ou **+tocar** para músicas e **+i** para instants. Comandos em PT-BR e EN disponíveis.'
     )
     .addFields(
       {
-        name: '▶️ Tocar um som do MyInstants (link)',
+        name: '🚀 Comandos principais (PT-BR / EN)',
+        value:
+          '```\n+p <texto|link>\n+play <texto|link>\n+tocar <texto|link>\n+i <texto|link-myinstants>\n+stop\n+skip\n```\n' +
+          'Exemplos: `+p legiao urbana`, `+play queen bohemian rhapsody`, `+i risada`\n' +
+          'Alias legado ainda aceito: `+d` / `+Ducz`.',
+      },
+      {
+        name: '▶️ Instant do MyInstants (link)',
         value:
           '```\n+i <link-do-myinstants>\n```\nExemplo: `+i https://www.myinstants.com/pt/instant/briga-de-gato-25101/`',
       },
       {
-        name: '🔍 Buscar e tocar um som do MyInstants',
+        name: '🔍 Buscar instant (PT-BR / EN)',
         value:
-          '```\n+i <descrição do som>\n```\nExemplo: `+i briga de gato`\n💡 *Sons do MyInstants tocam instantaneamente, mesmo com música do YouTube!*',
+          '```\n+i <descricao do som>\n```\nExemplo: `+i briga de gato`\n💡 *Instants tocam instantaneamente, mesmo com qualquer audio tocando!*',
       },
       {
-        name: '🎬 Tocar áudio por link (YouTube/SoundCloud/Spotify)',
+        name: '🎬 Tocar música por link (PT-BR / EN)',
         value:
-          '```\n+d <link-do-youtube|soundcloud|spotify-track|spotify-playlist|spotify-album|spotify-artist>\n```\nExemplo: `+d https://www.youtube.com/watch?v=dQw4w9WgXcQ`\nAlias: `+play <link>`',
+          '```\n+p <youtube|soundcloud|spotify>\n\n+play <youtube|soundcloud|spotify>\n\n+tocar <youtube|soundcloud|spotify>\n```\nSuportado: YouTube, SoundCloud, Spotify (track/playlist/album/artist)\nExemplo: `+p https://www.youtube.com/watch?v=dQw4w9WgXcQ`',
       },
       {
-        name: '🔎 Buscar e tocar do YouTube',
+        name: '🔎 Buscar e tocar música (PT-BR / EN)',
         value:
-          '```\n+d <nome da música>\n```\nExemplo: `+d nirvana smells like teen spirit`\nAlias: `+play <busca>`',
+          '```\n+p <nome da música>\n+play <music name>\n+tocar <nome da música>\n```\nExemplo: `+p nirvana smells like teen spirit`',
       },
       {
         name: '📋 Playlist do YouTube',
         value:
-          '```\n+d <link-da-playlist>\n```\nColoque um link com `&list=` e todas as músicas serão adicionadas à fila!',
+          '```\n+p <link-da-playlist>\n```\nColoque um link com `&list=` e todas as músicas serão adicionadas à fila!',
       },
       {
-        name: '⏭️ Pular música',
-        value: '```\n+d skip\n```',
+        name: '⏭️ Pular música (PT-BR / EN)',
+        value: '```\n+skip\n+pular\n```',
       },
       {
         name: '📋 Ver fila de músicas',
-        value: '```\n+d fila\n```',
+        value: '```\n+fila\n+queue\n```',
       },
       {
-        name: '⏹️ Parar e limpar fila',
-        value: '```\n+d parar\n```',
+        name: '⏹️ Parar e limpar fila (PT-BR / EN)',
+        value: '```\n+stop\n+parar\n```',
       },
       {
         name: '🎛️ Efeitos de áudio',
@@ -1265,20 +1396,20 @@ function buildHelpEmbed() {
       {
         name: '⚙️ Administração',
         value:
-          '```\n+d prefix\n+d prefix add <novo_prefixo>\n+d prefix remove <prefixo>\n+d prefix reset\n+killbot\n```\n`+killbot` é restrito ao dono do bot.',
+          '```\n+prefix\n+prefix <novo_prefixo>\n+prefix set <novo_prefixo>\n+prefix reset\n+killbot\n```\n`+killbot` é restrito ao dono do bot.',
       },
       {
         name: '🧩 Slash Commands (/)',
         value:
-          '```\n/play query:<texto|link>\n/instants query:<texto|link myinstants>\n/queue [posicao]\n/skip\n/stop\n/effect acao:<ativar|off|status|lista> [nome] [intensidade]\n/prefix acao:<view|add|remove|reset> [valor]\n/leave\n/help\n/killbot\n```',
+          '```\n/play query:<texto|link>\n/instants query:<texto|link myinstants>\n/queue [posicao]\n/skip\n/stop\n/effect acao:<ativar|off|status|lista> [nome] [intensidade]\n/prefix acao:<view|set|reset> [valor]\n/leave\n/help\n/killbot\n```',
       },
       {
         name: '🚪 Sair do canal de voz',
-        value: '```\n+d sair\n```',
+        value: '```\n+sair\n+leave\n```',
       },
       {
         name: '❓ Mostrar ajuda',
-        value: '```\n+help\n+d ajuda\n```',
+        value: '```\n+help\n+ajuda\n```',
       },
       {
         name: '👤 Créditos',
@@ -1322,6 +1453,11 @@ function normalizeSearchTerms(query) {
 
 function createInteractionMessageAdapter(interaction) {
   let replied = false;
+  const normalizeReplyOptions = (options) => {
+    if (typeof options === 'string') return { content: options };
+    if (!options || typeof options !== 'object') return { content: String(options ?? '') };
+    return options;
+  };
   return {
     isInteraction: true,
     guild: interaction.guild,
@@ -1334,11 +1470,12 @@ function createInteractionMessageAdapter(interaction) {
     },
     react: () => Promise.resolve(),
     reply: (options) => {
+      const normalized = normalizeReplyOptions(options);
       if (!replied) {
         replied = true;
-        return interaction.reply({ ...options, fetchReply: true });
+        return interaction.reply({ ...normalized, fetchReply: true });
       }
-      return interaction.followUp(options);
+      return interaction.followUp(normalized);
     },
   };
 }
@@ -1434,10 +1571,10 @@ async function handlePlayQuery(message, query) {
         };
 
         for await (const track of getSoundCloudPlaylistTracksStream(input)) {
+
           if (!isSpotifyLoadSessionActive(message.guildId, scLoadToken)) break;
           pending.push(track);
-          
-          // Flush deterministically:
+
           // - On first track: flush just that 1
           // - When pending reaches 5+ tracks after first: flush 5 at a time
           if (totalAdded === 0 || pending.length >= soundCloudBatchSize) {
@@ -1849,7 +1986,7 @@ const slashCommands = [
   },
   {
     name: 'prefix',
-    description: 'Gerencia prefixos personalizados da guild',
+    description: 'Visualiza, define ou reseta prefixo personalizado da guild',
     options: [
       {
         name: 'acao',
@@ -1858,15 +1995,14 @@ const slashCommands = [
         required: true,
         choices: [
           { name: 'view', value: 'view' },
-          { name: 'add', value: 'add' },
-          { name: 'remove', value: 'remove' },
+          { name: 'set', value: 'set' },
           { name: 'reset', value: 'reset' },
         ],
       },
       {
         name: 'valor',
         type: 3, // STRING
-        description: 'Prefixo para add/remove',
+        description: 'Prefixo para set',
         required: false,
       },
     ],
@@ -1892,20 +2028,19 @@ async function registerSlashCommands() {
 }
 
 // ============================================================
-// Evento: Bot pronto
 // ============================================================
 function onClientReady() {
   console.log(`✅ BotDucz está online como ${client.user.tag}`);
   console.log(`📡 Conectado a ${client.guilds.cache.size} servidor(es)`);
   console.log(`🧩 BotDucz ${BOT_BUILD_TAG}`);  
   console.log(`🕒 Auto-leave sozinho: ${AUTO_LEAVE_MINUTES} minuto(s)`);
+  updatePresenceHelpHint(null, '+p');
   updateBotPresence(null);
   loadPrefixes();
   registerSlashCommands();
 }
 
 client.once('clientReady', onClientReady);
-
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const guild = newState.guild || oldState.guild;
   if (!guild || !client.user) return;
@@ -1947,13 +2082,15 @@ client.on('messageCreate', async (message) => {
     if (message.content.toLowerCase().startsWith(p.toLowerCase())) {
       const nextChar = message.content[p.length];
       const lower = p.toLowerCase();
-      const requiresSpace = ['+p', '+play', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+clear'].includes(lower);
+      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
       if (requiresSpace && nextChar && !/\s/.test(nextChar)) continue;
       usedPrefix = p;
       break;
     }
   }
   if (!usedPrefix) return;
+
+  updatePresenceHelpHint(message.guildId, usedPrefix);
 
   // Suporte a comandos como +skip / +stop sem precisar do +d
   const normalizedPrefix = usedPrefix.toLowerCase();
@@ -1968,6 +2105,53 @@ client.on('messageCreate', async (message) => {
     updateBotPresence(null);
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
+  }
+  if (normalizedPrefix === '+parar') {
+    clearSpotifyLoadSession(message.guildId);
+    const result = await stop(message);
+    updateBotPresence(null);
+    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+    return result;
+  }
+  if (normalizedPrefix === '+pular') {
+    const result = await skip(message);
+    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+    return result;
+  }
+  if (normalizedPrefix === '+sair' || normalizedPrefix === '+leave') {
+    clearSpotifyLoadSession(message.guildId);
+    const result = leave(message);
+    updateBotPresence(null);
+    return result;
+  }
+  if (normalizedPrefix === '+ajuda') return sendDismissableHelpMessage(message);
+  if (normalizedPrefix === '+prefix') {
+    const raw = message.content.slice(usedPrefix.length).trim();
+    const parts = raw ? ['prefix', ...raw.split(/\s+/)] : ['prefix'];
+    const sub = parts[1]?.toLowerCase();
+    if (!sub) {
+      const custom = guildPrefixes[message.guildId] || [];
+      return message.reply(
+        `Prefixos atuais: ${getPrefixes(message.guildId).join(', ')}\n` +
+          `Prefixos personalizados: ${custom.length ? custom.join(', ') : 'nenhum'}\n` +
+          'Uso: `+prefix <novo_prefixo>` | `+prefix set <novo_prefixo>` | `+prefix reset`'
+      );
+    }
+    if (sub === 'reset') {
+      setPrefixes(message.guildId, []);
+      updatePresenceHelpHint(message.guildId, '+p');
+      updateBotPresence(null);
+      return message.reply('✅ Prefixo personalizado removido (voltou para os padrões).');
+    }
+    const isSetKeyword = sub === 'set';
+    const newPrefix = isSetKeyword ? parts[2] : parts[1];
+    if (!newPrefix) {
+      return message.reply('❌ Uso: `+prefix <novo_prefixo>` | `+prefix set <novo_prefixo>` | `+prefix reset`');
+    }
+    setPrefixes(message.guildId, [newPrefix]);
+    updatePresenceHelpHint(message.guildId, newPrefix);
+    updateBotPresence(null);
+    return message.reply(`✅ Prefixo personalizado definido para **${newPrefix}**.`);
   }
   if (normalizedPrefix === '+clear') {
     const raw = message.content.slice(usedPrefix.length).trim();
@@ -2050,6 +2234,7 @@ client.on('messageCreate', async (message) => {
       .join('\n');
 
     if (!rawArgs) {
+      clearEffectErrorMessage(message.guildId);
       return sendDismissableEffectMessage(
         message,
         `🎸 Efeitos disponíveis:\n${listWithDescriptions}\n\n` +
@@ -2061,6 +2246,7 @@ client.on('messageCreate', async (message) => {
     }
 
     if (parts[0] === 'lista' || parts[0] === 'list') {
+      clearEffectErrorMessage(message.guildId);
       return sendDismissableEffectMessage(
         message,
         `🎛️ **Lista de efeitos**\n${listWithDescriptions}\n\n` +
@@ -2073,17 +2259,20 @@ client.on('messageCreate', async (message) => {
     const isOnlyNumberToken = /^\d+$/.test(parts[0]);
     if (parts.length === 1 && isOnlyNumberToken && !isNaN(firstNum) && firstNum >= 1 && firstNum <= 10) {
       if (!currentEffect) {
+        clearEffectErrorMessage(message.guildId);
         return message.reply('ℹ️ Nenhum efeito ativo. Ative um efeito primeiro com `+efeito <nome>` ou `+ef <nome>`.');
       }
       if (!effectSupportsIntensity(currentEffect)) {
+        clearEffectErrorMessage(message.guildId);
         return message.reply(`ℹ️ O efeito **${currentEffect}** não usa intensidade. Ele tem configuração fixa.`);
       }
       setEffectIntensity(message.guildId, firstNum);
       const appliedNow = applyEffectNow(message.guildId);
-      return message.reply(
+      clearEffectErrorMessage(message.guildId);
+      return sendTimedEffectConfirm(message, message.guildId,
         appliedNow
-          ? `🎛️ Intensidade do efeito **${currentEffect}** alterada para **${firstNum}/10** e aplicada imediatamente.`
-          : `🎛️ Intensidade do efeito **${currentEffect}** alterada para **${firstNum}/10**.`
+          ? `✅ Efeito **${currentEffect}** (intensidade ${firstNum}/10) aplicado imediatamente.`
+          : `✅ Efeito **${currentEffect}** (intensidade ${firstNum}/10) definido.`
       );
     }
 
@@ -2092,6 +2281,7 @@ client.on('messageCreate', async (message) => {
     const intensity = (rawI !== null && !isNaN(rawI) && rawI >= 1 && rawI <= 10) ? rawI : null;
 
     if (effect === 'status') {
+      clearEffectErrorMessage(message.guildId);
       return message.reply(
         currentEffect
           ? `🎛️ Efeito atual: **${currentEffect}** | Intensidade: **${currentIntensity}/10**`
@@ -2103,20 +2293,20 @@ client.on('messageCreate', async (message) => {
 
     if (effect === 'off' || effect === 'none') {
       if (!currentEffect) {
+        clearEffectErrorMessage(message.guildId);
         return message.reply('ℹ️ O efeito já está desativado.');
       }
 
       setEffect(message.guildId, null);
       const appliedNow = applyEffectNow(message.guildId);
-      return message.reply(
-        appliedNow
-          ? '✅ Efeitos desativados e aplicado à música atual.'
-          : '✅ Efeitos desativados.'
+      clearEffectErrorMessage(message.guildId);
+      return sendTimedEffectConfirm(message, message.guildId,
+        appliedNow ? '✅ Efeitos desativados e aplicado à música atual.' : '✅ Efeitos desativados.'
       );
     }
 
     if (!list.includes(effect)) {
-      return message.reply(`❌ Efeito desconhecido. Use um dos: ${list.join(', ')}\nDica: \`+efeito <nome> <1-10>\` ou \`+ef <nome> <1-10>\`.`);
+      return sendTimedEffectError(message, message.guildId, `❌ Efeito desconhecido. Use um dos: ${list.join(', ')}\nDica: \`+efeito <nome> <1-10>\` ou \`+ef <nome> <1-10>\`.`);
     }
 
     if (intensity !== null && effectSupportsIntensity(effect)) {
@@ -2125,6 +2315,7 @@ client.on('messageCreate', async (message) => {
 
     // Mesmo efeito ativo sem nova intensidade = sem mudança
     if (currentEffect === effect && intensity === null) {
+      clearEffectErrorMessage(message.guildId);
       return message.reply(`ℹ️ O efeito **${effect}** já está ativo (intensidade ${currentIntensity}/10). Use \`+efeito ${effect} <1-10>\` ou \`+ef ${effect} <1-10>\` para mudar a intensidade.`);
     }
 
@@ -2156,7 +2347,32 @@ client.on('messageCreate', async (message) => {
   const cmd = argsParts[0].toLowerCase();
 
   if (cmd === 'ajuda') return sendDismissableHelpMessage(message);
+  if (cmd === 'help') return sendDismissableHelpMessage(message);
+  if (normalizedPrefix === '+p' && ['skip', 'pular', 'stop', 'parar', 'sair', 'leave', 'help', 'ajuda', 'queue', 'fila', 'prefix', 'instant', 'instants'].includes(cmd)) {
+    return message.reply('ℹ️ O `+p` agora é exclusivo para tocar música. Use `+skip`, `+stop`, `+fila`, `+help`, `+sair`, `+prefix` e `+i` para os demais comandos.');
+  }
+  if (cmd === 'play' || cmd === 'tocar') {
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Use `+p <texto|link>` (sem `play`/`tocar` depois do `+p`).');
+    }
+    const query = argsParts.slice(1).join(' ').trim();
+    if (!query) return message.reply('❌ Uso: `+p <texto|link>` ou `+play <texto|link>` ou `+tocar <texto|link>`.');
+    await handlePlayQuery(message, query);
+    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+    return;
+  }
+  if (cmd === 'instant' || cmd === 'instants') {
+    const query = argsParts.slice(1).join(' ').trim();
+    if (!query) return message.reply('❌ Uso: `+i <texto|link-myinstants>`.');
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Para instant use `+i <texto|link-myinstants>` (sem `+p`).');
+    }
+    return handleInstantsQuery(message, query);
+  }
   if (cmd === 'parar' || cmd === 'stop') {
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Use `+stop` ou `+parar` (sem `+p`).');
+    }
     clearSpotifyLoadSession(message.guildId);
     const result = await stop(message, (text) => sendEphemeralMessage(message, text));
     updateBotPresence(null);
@@ -2164,14 +2380,20 @@ client.on('messageCreate', async (message) => {
     return result;
   }
   if (cmd === 'sair') {
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Use `+sair` ou `+leave` (sem `+p`).');
+    }
     clearSpotifyLoadSession(message.guildId);
     const result = leave(message);
     updateBotPresence(null);
     return result;
   }
   if (cmd === 'skip' || cmd === 'pular') {
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Use `+skip` ou `+pular` (sem `+p`).');
+    }
     const result = await skip(message, (text) => sendEphemeralMessage(message, text));
-    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+    await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return result;
   }
   if (cmd === 'clear') {
@@ -2189,34 +2411,36 @@ client.on('messageCreate', async (message) => {
 
   // Prefixo personalizado (por guilda)
   if (cmd === 'prefix') {
+    if (normalizedPrefix === '+p') {
+      return message.reply('ℹ️ Use `+prefix` (sem `+p`) para gerenciar prefixos.');
+    }
     const sub = argsParts[1]?.toLowerCase();
     if (!sub) {
       const custom = guildPrefixes[message.guildId] || [];
       return message.reply(
         `Prefixos atuais: ${getPrefixes(message.guildId).join(', ')}\n` +
           `Prefixos personalizados: ${custom.length ? custom.join(', ') : 'nenhum'}\n` +
-          'Uso: `+d prefix [add|remove|reset] <prefixo>`'
+          'Uso: `+prefix <novo_prefixo>` | `+prefix set <novo_prefixo>` | `+prefix reset`'
       );
-    }
-
-    if (sub === 'add' && argsParts[2]) {
-      const newP = argsParts[2];
-      addPrefix(message.guildId, newP);
-      return message.reply(`✅ Prefixo **${newP}** adicionado!`);
-    }
-
-    if (sub === 'remove' && argsParts[2]) {
-      const remP = argsParts[2];
-      removePrefix(message.guildId, remP);
-      return message.reply(`✅ Prefixo **${remP}** removido!`);
     }
 
     if (sub === 'reset') {
       setPrefixes(message.guildId, []);
-      return message.reply('✅ Prefixos personalizados removidos (volta ao padrão).');
+      updatePresenceHelpHint(message.guildId, '+p');
+      updateBotPresence(null);
+      return message.reply('✅ Prefixo personalizado removido (voltou para os padrões).');
     }
 
-    return message.reply('✅ Uso: `+d prefix [add|remove|reset] <prefixo>`');
+    const isSetKeyword = sub === 'set';
+    const newPrefix = isSetKeyword ? argsParts[2] : argsParts[1];
+    if (!newPrefix) {
+      return message.reply('❌ Uso: `+prefix <novo_prefixo>` | `+prefix set <novo_prefixo>` | `+prefix reset`');
+    }
+
+    setPrefixes(message.guildId, [newPrefix]);
+    updatePresenceHelpHint(message.guildId, newPrefix);
+    updateBotPresence(null);
+    return message.reply(`✅ Prefixo personalizado definido para **${newPrefix}**.`);
   }
 
   if (cmd === 'fila' || cmd === 'queue') {
@@ -2343,18 +2567,19 @@ client.on('interactionCreate', async (interaction) => {
         return msg.reply(`ℹ️ O efeito **${effect}** já está ativo (intensidade ${currentIntensity}/10).`);
       }
 
-      setEffect(msg.guildId, effect);
-      const appliedNow = applyEffectNow(msg.guildId);
+      setEffect(message.guildId, effect);
+      const appliedNow = applyEffectNow(message.guildId);
       const supportsIntensity = effectSupportsIntensity(effect);
-      const effectiveIntensity = getEffectIntensity(msg.guildId);
-      return msg.reply(
+      const effectiveIntensity = getEffectIntensity(message.guildId);
+      clearEffectErrorMessage(message.guildId);
+      return sendTimedEffectConfirm(message, message.guildId,
         appliedNow
           ? supportsIntensity
             ? `✅ Efeito **${effect}** (intensidade ${effectiveIntensity}/10) ativado e aplicado imediatamente.`
-            : `✅ Efeito **${effect}** ativado e aplicado imediatamente (intensidade não aplicável).`
+            : `✅ Efeito **${effect}** ativado e aplicado imediatamente.`
           : supportsIntensity
-            ? `✅ Efeito **${effect}** (intensidade ${effectiveIntensity}/10) ativado.`
-            : `✅ Efeito **${effect}** ativado (intensidade não aplicável).`
+            ? `✅ Efeito **${effect}** (intensidade ${effectiveIntensity}/10) ativado. Vale para as próximas músicas.`
+            : `✅ Efeito **${effect}** ativado. Vale para as próximas músicas.`
       );
     }
 
@@ -2370,21 +2595,19 @@ client.on('interactionCreate', async (interaction) => {
         );
       }
 
-      if (action === 'add') {
+      if (action === 'set') {
         if (!value) return msg.reply('❌ Informe o valor do prefixo em `valor`.');
-        addPrefix(msg.guildId, value);
-        return msg.reply(`✅ Prefixo **${value}** adicionado.`);
-      }
-
-      if (action === 'remove') {
-        if (!value) return msg.reply('❌ Informe o valor do prefixo em `valor`.');
-        removePrefix(msg.guildId, value);
-        return msg.reply(`✅ Prefixo **${value}** removido.`);
+        setPrefixes(msg.guildId, [value]);
+        updatePresenceHelpHint(msg.guildId, value);
+        updateBotPresence(null);
+        return msg.reply(`✅ Prefixo personalizado definido para **${value}**.`);
       }
 
       if (action === 'reset') {
         setPrefixes(msg.guildId, []);
-        return msg.reply('✅ Prefixos personalizados removidos (volta ao padrão).');
+        updatePresenceHelpHint(msg.guildId, '+p');
+        updateBotPresence(null);
+        return msg.reply('✅ Prefixo personalizado removido (voltou para os padrões).');
       }
     }
 
@@ -2415,6 +2638,13 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isModalSubmit()) {
     if (interaction.customId !== 'queue_play_modal') return;
 
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).',
+        ephemeral: true,
+      });
+    }
+
     const positionValue = interaction.fields.getTextInputValue('queuePosition');
     const position = Number(positionValue);
     if (Number.isNaN(position) || position < 1) {
@@ -2439,7 +2669,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply('❌ Não consegui ir para essa música. Tente abrir `+fila` novamente.');
     }
 
-    await refreshQueueMessagesForGuild(interaction.guildId).catch(() => {});
+    await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return interaction.editReply(`▶️ Indo para a música #${position} da fila...`);
   }
 
@@ -2483,7 +2713,7 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferUpdate();
     const msgAdapter = createInteractionMessageAdapter(interaction);
     await skip(msgAdapter, () => Promise.resolve());
-    await refreshQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
+    await refreshQueueMessagesForGuild(msgAdapter.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return;
   }
 
@@ -2571,6 +2801,38 @@ client.on('interactionCreate', async (interaction) => {
     // Atualiza a mensagem com a próxima página
     await showQueueMessage(interaction.message, nextPage, interaction.message);
     return interaction.deferUpdate();
+  }
+
+  if (interaction.customId.startsWith('queue_loopplaylist_')) {
+    const entry = pendingQueueMessages.get(interaction.message.id);
+    if (!entry) return interaction.deferUpdate();
+    await interaction.deferUpdate().catch(() => {});
+    const loopInfo = toggleLoopPlaylist(interaction.guildId);
+    // Se ativou loop, navegar para a página da música atual com índice preciso
+    const ps = Number(BOT_CFG.ui?.queuePageSize) || 8;
+    const targetPage = loopInfo.enabled ? Math.floor((loopInfo.currentIndex || 0) / ps) : 0;
+    await showQueueMessage(interaction.message, targetPage, interaction.message).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_restart_')) {
+    const entry = pendingQueueMessages.get(interaction.message.id);
+    if (!entry) return interaction.deferUpdate();
+
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Reiniciar playlist.',
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+    restartPlaylist(interaction.guildId);
+    // Força o estado interno da paginação para a primeira página.
+    entry.page = 0;
+    pendingQueueMessages.set(interaction.message.id, entry);
+    await showQueueMessage(interaction.message, 0, interaction.message).catch(() => {});
+    return;
   }
 
   if (interaction.customId.startsWith('queue_play_')) {

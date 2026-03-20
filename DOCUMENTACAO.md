@@ -43,9 +43,11 @@ Tambem inclui:
 
 ### 4.1 Prefixo - reproducao
 
-- +i <texto|link-myinstants>
-- +d <texto|link>
-- +play <texto|link>
+- +i <texto|link-myinstants> (instant)
+- +p <texto|link>
+- +p tocar <texto|link>
+- +p play <text|link>
+- alias legado ainda aceito: +d / +Ducz
 
 ### 4.2 Prefixo - fila/controle
 
@@ -53,7 +55,9 @@ Tambem inclui:
 - +fila <n>
 - +skip
 - +stop
-- +d sair
+- +pular
+- +parar
+- +sair / +leave
 
 ### 4.3 Prefixo - efeitos
 
@@ -74,8 +78,11 @@ Tambem inclui:
 ### 4.5 Prefixo - utilitarios
 
 - +help
-- +d ajuda
-- +d prefix [add|remove|reset]
+- +ajuda
+- +prefix
+- +prefix <novo_prefixo>
+- +prefix set <novo_prefixo>
+- +prefix reset
 - +clear <1m|2h|1d>
 - +killbot (owner)
 
@@ -87,7 +94,7 @@ Tambem inclui:
 - /skip
 - /stop
 - /effect acao:<ativar|off|status|lista> [nome] [intensidade]
-- /prefix acao:<view|add|remove|reset> [valor]
+- /prefix acao:<view|set|reset> [valor]
 - /leave
 - /help
 - /killbot
@@ -105,10 +112,8 @@ Comportamento:
 
 ## 6. Presenca e resumo operacional (bio visivel)
 
-Quando nao ha musica tocando, o bot alterna linhas de presenca com:
-- fontes suportadas (MyInstants/YouTube/SoundCloud/Spotify)
-- recursos (fila, +ef, favoritos)
-- creditos (Luam Ducate e Bryan Christen)
+Quando nao ha musica tocando:
+- presenca exibe apenas +help
 
 Quando ha musica tocando:
 - presenca exibe titulo atual + "| +help"
