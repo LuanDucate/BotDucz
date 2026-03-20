@@ -14,6 +14,10 @@ Bot de Discord para reproduzir audio em canal de voz com suporte a:
 - Permite pular, parar, sair e ir para item especifico da fila
 - Aplica efeitos de audio com intensidade (+efeito e +ef)
 - Suporta favoritos compartilhados para buscas do +i (+fav)
+- Reacoes no +i: 🦆 repetir, 📢 tocar mais alto (uma vez), ⭐ favoritar
+- O status de favorito do mesmo +i reutiliza uma unica mensagem dinamica (salvo/removido)
+- Megafones 📢 antigos de instants sao limpos ao iniciar ou encerrar o bot
+- Mensagens de status de fila e "fila vazia" removidas automaticamente
 - Tem comandos slash organizados no menu /
 
 ## Estrutura de codigo (didatica)
@@ -44,6 +48,7 @@ Principais opcoes configuraveis:
 - Frequencia de refresh da fila em tela
 - Quantidade de favoritos exibidos no +fav
 - Quantidade de sugestoes e timeout de selecao do +i
+- Volume do megafone 📢 nos instants (sfx.megaphoneVolume, padrao 3.0)
 - Limites de playlist YouTube/Spotify
 - Batching e concorrencia de carregamento Spotify/SoundCloud
 - Cooldown de navegacao e tamanho maximo de historico da fila
@@ -102,6 +107,9 @@ Aliases legados ainda aceitos: +d e +Ducz.
 ### Reproducao
 
 - +i <texto|link-myinstants> (instant)
+  - Reaja com 🦆 para repetir o instant
+  - Reaja com 📢 para tocar mais alto uma unica vez (volume configuravel em bot.json → sfx.megaphoneVolume)
+  - Reaja com ⭐ para salvar/remover dos favoritos com uma unica mensagem de status por instant equivalente no canal
 - +p <texto|link-youtube|link-soundcloud|link-spotify>
 - +p tocar <texto|link>
 - +p play <text|link>
@@ -167,7 +175,19 @@ Aliases legados ainda aceitos: +d e +Ducz.
 
 ## Historico de modificacoes
 
-### v2.0.0 — 2026-03-19 (release atual)
+### v2.1.0 — 2026-03-20 (release atual)
+
+- Fix: +skip apos +p agora funciona corretamente (await no deferred skip)
+- UX: mensagem "⏳ carregando..." do skip adiado e removida automaticamente ao disparar
+- UX: mensagens de status de fila ("adicionada a fila", "X faixas adicionadas") removidas quando a fila esvazia
+- UX: mensagem "A fila esta vazia." removida ao iniciar nova musica ou novo +p
+- Novo: ordem das reacoes do +i ajustada para 🦆/📢/⭐; o 📢 toca o instant mais alto uma unica vez e depois desaparece
+- UX: megafones 📢 antigos de mensagens +i sao removidos automaticamente ao iniciar ou encerrar o bot
+- UX: feedback de favorito do mesmo instant agora alterna dinamicamente entre salvo/removido em uma unica mensagem por consulta equivalente
+- Config: bot.json → sfx.megaphoneVolume (volume do megafone, padrao 3.0)
+- Doc: README e DOCUMENTACAO atualizados para v2.1.0
+
+### v2.0.0 — 2026-03-19
 
 Versao principal que transforma o bot de um reprodutor basico (MyInstants + YouTube)
 numa plataforma completa de audio para Discord:

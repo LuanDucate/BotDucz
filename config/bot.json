@@ -8,6 +8,9 @@
   "autoLeave": {
     "defaultMinutes": 2
   },
+  "sfx": {
+    "megaphoneVolume": 3.0
+  },
   "ui": {
     "dismissTimeoutMs": 300000,
     "queueRefreshIntervalMs": 4000,

@@ -16,6 +16,7 @@ const { APP_CONFIG } = require('./config');
 const MQ_CFG = APP_CONFIG.musicQueue;
 const EFFECT_APPLY_COOLDOWN_MS = 250;
 const PLAY_NEXT_ERROR_DELAY_MS = 100;
+const ADVANCE_SUPPRESSION_WINDOW_MS = 5000;
 
 // ============================================================
 // Estado por guild
@@ -30,6 +31,7 @@ function setOnSongChangedCallback(cb) {
 function getGuildData(guildId) {
   if (!guilds.has(guildId)) {
     guilds.set(guildId, {
+      guildId,
       connection: null,
       musicPlayer: null,
       sfxPlayer: null,
@@ -57,6 +59,7 @@ function getGuildData(guildId) {
       advanceRequested: false,
       suppressNextIdleCount: 0,
       suppressNextErrorAdvanceCount: 0,
+      suppressAdvanceUntil: 0,
       navCooldownUntil: 0,
       effectApplyCooldownUntil: 0,
       effectApplyTimer: null,
@@ -64,7 +67,82 @@ function getGuildData(guildId) {
       externalMoveGraceUntil: 0,
     });
   }
-  return guilds.get(guildId);
+  const data = guilds.get(guildId);
+  if (!data.guildId) data.guildId = guildId;
+  return data;
+}
+
+function buildCanonicalPlaylist(data) {
+  if (!data) return [];
+  const all = [
+    ...(Array.isArray(data.playlistFull) ? data.playlistFull : []),
+    ...(Array.isArray(data.history) ? data.history : []),
+    ...(data.currentSong ? [data.currentSong] : []),
+    ...(Array.isArray(data.queue) ? data.queue : []),
+  ];
+
+  const seenSeq = new Set();
+  const seenFallback = new Set();
+  const uniq = [];
+
+  for (const song of all) {
+    if (!song) continue;
+    const seq = Number(song.sequence);
+    if (Number.isFinite(seq)) {
+      const k = `seq:${seq}`;
+      if (seenSeq.has(k)) continue;
+      seenSeq.add(k);
+      uniq.push(song);
+      continue;
+    }
+
+    const k = `fallback:${String(song.url || '')}|${String(song.title || '')}`;
+    if (seenFallback.has(k)) continue;
+    seenFallback.add(k);
+    uniq.push(song);
+  }
+
+  // Ordem estável pela sequência original de inserção.
+  uniq.sort((a, b) => {
+    const sa = Number.isFinite(Number(a?.sequence)) ? Number(a.sequence) : Number.MAX_SAFE_INTEGER;
+    const sb = Number.isFinite(Number(b?.sequence)) ? Number(b.sequence) : Number.MAX_SAFE_INTEGER;
+    return sa - sb;
+  });
+
+  return uniq.map((s) => ({ ...s }));
+}
+
+function findSongIndexInList(list, target) {
+  if (!Array.isArray(list) || !target) return -1;
+  return list.findIndex((song) => {
+    if (!song) return false;
+    if (Number.isFinite(song.sequence) && Number.isFinite(target.sequence)) {
+      return song.sequence === target.sequence;
+    }
+    return song.url === target.url && song.title === target.title;
+  });
+}
+
+function trimHistoryIfNeeded(data) {
+  if (!data || data.loopPlaylist) return;
+  while (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) {
+    data.history.shift();
+  }
+}
+
+function getLoopPlaylistView(data) {
+  if (!data || !data.loopPlaylist) {
+    return { songs: [], currentIndex: -1 };
+  }
+
+  const songs = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+  const currentIndex = findSongIndexInList(songs, data.currentSong);
+  return { songs, currentIndex };
+}
+
+function refreshLoopPlaylistSnapshot(data) {
+  if (!data) return;
+  data.playlistFull = buildCanonicalPlaylist(data);
 }
 
 function buildCanonicalPlaylist(data) {
@@ -307,6 +385,7 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   if (replacingActiveResource) {
     data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
     data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+    data.suppressAdvanceUntil = Date.now() + ADVANCE_SUPPRESSION_WINDOW_MS;
   }
 
   data.currentSong = song;
@@ -471,6 +550,7 @@ async function ensureConnection(message) {
   }
 
   const data = getGuildData(message.guildId);
+  data.guildId = message.guildId;
 
   const currentState = data.connection?.state?.status;
   const isReady = currentState === VoiceConnectionStatus.Ready;
@@ -513,8 +593,17 @@ async function ensureConnection(message) {
     data.musicPlayer = createAudioPlayer();
 
     data.musicPlayer.on(AudioPlayerStatus.Idle, () => {
+      if ((data.suppressAdvanceUntil || 0) > 0 && Date.now() > data.suppressAdvanceUntil) {
+        data.suppressNextIdleCount = 0;
+        data.suppressNextErrorAdvanceCount = 0;
+        data.suppressAdvanceUntil = 0;
+      }
+
       if ((data.suppressNextIdleCount || 0) > 0) {
         data.suppressNextIdleCount -= 1;
+        if ((data.suppressNextIdleCount || 0) <= 0 && (data.suppressNextErrorAdvanceCount || 0) <= 0) {
+          data.suppressAdvanceUntil = 0;
+        }
         return;
       }
 
@@ -530,24 +619,33 @@ async function ensureConnection(message) {
 
       if (data.loop && lastSong) {
         // Loop ativo: repete a mesma música sem avançar a fila
-        playSong(message.guildId, lastSong);
+        playSong(data.guildId, lastSong);
       } else {
         // Histórico para o botão ⏮️ voltar (limitado para não crescer sem fim)
         if (lastSong) {
           if (!Array.isArray(data.history)) data.history = [];
           data.history.push(lastSong);
-          if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+          trimHistoryIfNeeded(data);
         }
-        schedulePlayNext(message.guildId, 0);
+        schedulePlayNext(data.guildId, 0);
       }
     });
 
     data.musicPlayer.on('error', (error) => {
+      if ((data.suppressAdvanceUntil || 0) > 0 && Date.now() > data.suppressAdvanceUntil) {
+        data.suppressNextIdleCount = 0;
+        data.suppressNextErrorAdvanceCount = 0;
+        data.suppressAdvanceUntil = 0;
+      }
+
       if ((data.suppressNextErrorAdvanceCount || 0) > 0) {
         data.suppressNextErrorAdvanceCount -= 1;
         // Um recurso antigo emitiu Error em vez de Idle — consome também o idle counter
         // para evitar que suppressNextIdleCount acumule e suprima avanços de fila reais.
         if ((data.suppressNextIdleCount || 0) > 0) data.suppressNextIdleCount -= 1;
+        if ((data.suppressNextIdleCount || 0) <= 0 && (data.suppressNextErrorAdvanceCount || 0) <= 0) {
+          data.suppressAdvanceUntil = 0;
+        }
         console.warn('⚠️ Ignorando erro do recurso anterior durante troca manual.');
         return;
       }
@@ -557,7 +655,7 @@ async function ensureConnection(message) {
         cleanupCurrentStream(data);
         data.currentSong = null;
         data.currentSongOffsetSeconds = 0;
-        schedulePlayNext(message.guildId, PLAY_NEXT_ERROR_DELAY_MS);
+        schedulePlayNext(data.guildId, PLAY_NEXT_ERROR_DELAY_MS);
         return;
       }
 
@@ -565,7 +663,7 @@ async function ensureConnection(message) {
       cleanupCurrentStream(data);
       data.currentSong = null;
       data.currentSongOffsetSeconds = 0;
-      schedulePlayNext(message.guildId, 0);
+      schedulePlayNext(data.guildId, 0);
     });
   }
 
@@ -1028,7 +1126,7 @@ async function playNext(guildId) {
   data.advanceInProgress = true;
   try {
     if (data.queue.length === 0) {
-      if (data.loopPlaylist && !data.loop) {
+      if (data.loopPlaylist) {
         // Loop de playlist: reabastece a fila do início usando snapshot canônico.
         const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
         if (full.length === 0) {
@@ -1074,7 +1172,7 @@ async function playNext(guildId) {
       cleanupCurrentStream(data);
       if (data.queue.length > 0) {
         schedulePlayNext(guildId, PLAY_NEXT_ERROR_DELAY_MS);
-      } else if (data.loopPlaylist && !data.loop) {
+      } else if (data.loopPlaylist) {
         const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
         if (full.length === 0) return;
         data.playlistFull = full.map((s) => ({ ...s }));
@@ -1097,6 +1195,11 @@ async function playNext(guildId) {
  */
 async function addYouTube(message, url, title) {
   const data = await ensureConnection(message);
+  const startingFreshSession = !data.currentSong && data.queue.length === 0;
+  if (startingFreshSession) {
+    data.history = [];
+    data.playlistFull = [];
+  }
   const song = { url, title: title || 'vídeo do YouTube' };
   if (!Number.isFinite(song.sequence)) {
     data.sequenceCounter = (data.sequenceCounter || 0) + 1;
@@ -1114,12 +1217,14 @@ async function addYouTube(message, url, title) {
     data.queue.push(song);
     refreshLoopPlaylistSnapshot(data);
     playNext(message.guildId);
+    return null;
   } else {
     data.queue.push(song);
     refreshLoopPlaylistSnapshot(data);
     const position = data.queue.length;
-    message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`);
+    const sentMsg = await message.reply(`📋 **${song.title}** adicionada à fila (posição #${position})`).catch(() => null);
     await refreshNowPlayingMessage(message.guildId).catch(() => {});
+    return sentMsg;
   }
 }
 
@@ -1131,6 +1236,11 @@ async function addYouTube(message, url, title) {
  */
 async function addPlaylist(message, videos, opts = {}) {
   const data = await ensureConnection(message);
+  const startingFreshSession = !data.currentSong && data.queue.length === 0;
+  if (startingFreshSession) {
+    data.history = [];
+    data.playlistFull = [];
+  }
 
   // CRITICAL: isActive deve considerar Buffering também, senão playNext() é chamado prematuramente!
   const isActive =
@@ -1186,7 +1296,7 @@ async function addPlaylist(message, videos, opts = {}) {
  * Se há música tocando, pausa ela brevemente, toca o SFX,
  * e depois retoma a música.
  */
-async function playSfx(message, tmpFile, displayName) {
+async function playSfx(message, tmpFile, displayName, volumeMultiplier = 1.0) {
   const data = await ensureConnection(message);
   const requesterId = message.author?.id || '0';
   const sfxToken = (data.sfxPlaybackToken || 0) + 1;
@@ -1204,7 +1314,12 @@ async function playSfx(message, tmpFile, displayName) {
   // Inscrever sfx player na conexão
   data.connection.subscribe(data.sfxPlayer);
 
-  const resource = createAudioResource(tmpFile);
+  const effectiveVol = Number.isFinite(Number(volumeMultiplier)) ? Number(volumeMultiplier) : 1.0;
+  const useInlineVolume = Math.abs(effectiveVol - 1.0) > 0.001;
+  const resource = useInlineVolume
+    ? createAudioResource(tmpFile, { inlineVolume: true })
+    : createAudioResource(tmpFile);
+  if (useInlineVolume) resource.volume.setVolume(effectiveVol);
   data.sfxPlayer.play(resource);
 
   // Mensagem temporária para não poluir o chat
@@ -1317,10 +1432,9 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
 
   // Add current song to history before advancing
   if (!Array.isArray(data.history)) data.history = [];
-  const skipped = data.currentSong.title;
   if (data.currentSong) {
     data.history.push(data.currentSong);
-    if (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+    trimHistoryIfNeeded(data);
   }
 
   // Get next song WITHOUT revealing it yet
@@ -1334,13 +1448,20 @@ async function skip(message, replyFn = (text) => message.reply(text)) {
   
   // Update UI and notify
   await refreshNowPlayingMessage(message.guildId).catch(() => {});
-  await replyFn(`⏭️ Pulando: **${skipped}**`);
 }
 
 
 async function stop(message, replyFn = (text) => message.reply(text)) {
   const data = guilds.get(message.guildId);
-  if (!data || (!data.currentSong && data.queue.length === 0)) {
+  if (!data) {
+    await replyFn('❌ Nenhum áudio está tocando no momento.');
+    return;
+  }
+
+  const hasActiveAudioOrQueue = Boolean(data.currentSong) || data.queue.length > 0;
+  const hasAnyLoopEnabled = Boolean(data.loop) || Boolean(data.loopPlaylist);
+
+  if (!hasActiveAudioOrQueue && !hasAnyLoopEnabled) {
     await replyFn('❌ Nenhum áudio está tocando no momento.');
     return;
   }
@@ -1359,6 +1480,7 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
   data.currentSequence = 0;
   data.sequenceCounter = 0;
   data.history = [];
+  data.loop = false;
   data.loopPlaylist = false;
   data.playlistFull = [];
   data.musicPausedForSfx = false;
@@ -1370,7 +1492,6 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
   data.navCooldownUntil = 0;
   if (data.musicPlayer) data.musicPlayer.stop();
   if (data.sfxPlayer) data.sfxPlayer.stop();
-  await replyFn('⏹️ Áudio parado e fila limpa!');
 }
 
 function leave(message) {
@@ -1502,6 +1623,25 @@ async function jumpTo(guildId, position) {
   const data = guilds.get(guildId);
   if (!data) return false;
 
+  if (data.loopPlaylist) {
+    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+    const idx = Math.floor(position) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= full.length) return false;
+
+    const targetSong = full[idx];
+    if (!targetSong) return false;
+
+    data.playlistFull = full.map((song) => ({ ...song }));
+    data.history = full.slice(0, idx).map((song) => ({ ...song }));
+    data.queue = full.slice(idx + 1).map((song) => ({ ...song }));
+
+    await ensurePlayableSong(targetSong).catch(() => {});
+    playSong(guildId, { ...targetSong }, 0, true);
+    await refreshNowPlayingMessage(guildId).catch(() => {});
+
+    return true;
+  }
+
   // Position is 1-based index into the queue (not including the current song)
   const idx = Math.floor(position) - 1;
   if (isNaN(idx) || idx < 0 || idx >= data.queue.length) return false;
@@ -1515,7 +1655,7 @@ async function jumpTo(guildId, position) {
 
   if (data.currentSong) data.history.push(data.currentSong);
   if (skippedBeforeTarget.length > 0) data.history.push(...skippedBeforeTarget);
-  while (data.history.length > (Number(MQ_CFG.maxHistoryItems) || 100)) data.history.shift();
+  trimHistoryIfNeeded(data);
 
   await ensurePlayableSong(targetSong).catch(() => {});
   playSong(guildId, targetSong, 0, true);
@@ -1545,19 +1685,7 @@ function toggleLoopPlaylist(guildId) {
   if (data.loopPlaylist) {
     // Snapshot canônico por ordem original (sequence), robusto para jump/skip durante carregamento.
     data.playlistFull = buildCanonicalPlaylist(data);
-    const current = data.currentSong;
-    let currentIndex = 0;
-    if (current) {
-      const idx = data.playlistFull.findIndex((song) => {
-        if (!song) return false;
-        // Preferência por sequence; fallback por url+title.
-        if (Number.isFinite(song.sequence) && Number.isFinite(current.sequence)) {
-          return song.sequence === current.sequence;
-        }
-        return song.url === current.url && song.title === current.title;
-      });
-      if (idx >= 0) currentIndex = idx;
-    }
+    const currentIndex = Math.max(0, findSongIndexInList(data.playlistFull, data.currentSong));
     return { enabled: true, currentIndex, total: data.playlistFull.length };
   } else {
     data.playlistFull = [];
@@ -1572,11 +1700,14 @@ function getLoopPlaylist(guildId) {
 function getQueueFull(guildId) {
   const data = guilds.get(guildId);
   if (!data) return { current: null, queue: [], history: [], loopPlaylist: false, effect: null, effectIntensity: 5 };
+  const loopView = getLoopPlaylistView(data);
   return {
     current: data.currentSong,
     queue: [...data.queue],
     history: [...(data.history || [])],
     loopPlaylist: data.loopPlaylist || false,
+    playlistSongs: loopView.songs,
+    currentIndex: loopView.currentIndex,
     effect: data.effect,
     effectIntensity: data.effectIntensity || 5,
   };
