@@ -3736,6 +3736,38 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
+  if (interaction.customId.startsWith('queue_loopplaylist_')) {
+    const entry = pendingQueueMessages.get(interaction.message.id);
+    if (!entry) return interaction.deferUpdate();
+    await interaction.deferUpdate().catch(() => {});
+    const loopInfo = toggleLoopPlaylist(interaction.guildId);
+    // Se ativou loop, navegar para a página da música atual com índice preciso
+    const ps = Number(BOT_CFG.ui?.queuePageSize) || 8;
+    const targetPage = loopInfo.enabled ? Math.floor((loopInfo.currentIndex || 0) / ps) : 0;
+    await showQueueMessage(interaction.message, targetPage, interaction.message).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_restart_')) {
+    const entry = pendingQueueMessages.get(interaction.message.id);
+    if (!entry) return interaction.deferUpdate();
+
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Reiniciar playlist.',
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+    restartPlaylist(interaction.guildId);
+    // Força o estado interno da paginação para a primeira página.
+    entry.page = 0;
+    pendingQueueMessages.set(interaction.message.id, entry);
+    await showQueueMessage(interaction.message, 0, interaction.message).catch(() => {});
+    return;
+  }
+
   if (interaction.customId.startsWith('queue_play_')) {
     if (isPlaylistLoadInProgress(interaction.guildId)) {
       return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).', ephemeral: true });
