@@ -13,6 +13,7 @@ const {
   Routes,
   Client,
   GatewayIntentBits,
+  Partials,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
@@ -72,7 +73,7 @@ const { toggleLoop, getLoop, toggleLoopPlaylist, getLoopPlaylist, restartPlaylis
 
 // Evita rodar duas instâncias na mesma máquina (cria um lock file)
 const lockFilePath = path.join(__dirname, 'bot.lock');
-const BOT_VERSION = '2.0.0';
+const BOT_VERSION = '2.1.0';
 const BOT_BUILD_TAG = `v${BOT_VERSION}`;
 const BOT_CFG = APP_CONFIG.bot;
 const SOURCES_CFG = APP_CONFIG.sources;
@@ -133,7 +134,7 @@ function ensureSingleInstance() {
       const matches = [...output.matchAll(/ProcessId=(\d+)/g)].map((m) => Number(m[1]));
       for (const pid of matches) {
         if (!pid || pid === currentPid) continue;
-        // Para checar se é o bot, buscamos 'index.js' na saída completa
+          '🦆 Reaja com **🦆** para repetir • 📢 **📢** para tocar mais alto (uma vez) • ⭐ **⭐** para favoritar/remover com 1 mensagem dinamica por instant',
         const blockRegex = new RegExp(`ProcessId=${pid}[\\s\\S]*?CommandLine=(.*?)(?:\\r?\\n\\r?\\n|$)`, 'i');
         const m = output.match(blockRegex);
         const cmd = m ? (m[1] || '') : '';
@@ -163,8 +164,12 @@ function ensureSingleInstance() {
   };
 
   process.on('exit', cleanup);
-  process.on('SIGINT', () => process.exit(0));
-  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => {
+    shutdownBot().catch(() => process.exit(0));
+  });
+  process.on('SIGTERM', () => {
+    shutdownBot().catch(() => process.exit(0));
+  });
   process.on('uncaughtException', (err) => {
     // EPIPE e EOF podem acontecer ao trocar streams (ffmpeg/yt-dlp) rapidamente.
     // Não queremos encerrar o bot por isso.
@@ -187,7 +192,12 @@ function ensureSingleInstance() {
   });
 }
 
+let shutdownInFlight = null;
+
 async function shutdownBot() {
+  if (shutdownInFlight) return shutdownInFlight;
+
+  shutdownInFlight = (async () => {
   // Mata instância antiga (se houver) antes de encerrar esta.
   if (fs.existsSync(lockFilePath)) {
     const oldPid = Number(fs.readFileSync(lockFilePath, 'utf-8'));
@@ -195,6 +205,12 @@ async function shutdownBot() {
       killProcess(oldPid);
     }
   }
+
+  for (const messageId of Array.from(pendingSfxRepeats.keys())) {
+    cleanupPendingSfxRepeat(messageId);
+  }
+
+  await clearOldInstantMegaphonesInAllGuildTextChannels().catch(() => {});
 
   try {
     await client.destroy();
@@ -204,6 +220,9 @@ async function shutdownBot() {
 
   // Dá tempo para enviar mensagens de confirmação antes de sair.
   setTimeout(() => process.exit(0), 250);
+  })();
+
+  return shutdownInFlight;
 }
 
 ensureSingleInstance();
@@ -232,6 +251,25 @@ const AUTO_LEAVE_MINUTES = Number.isFinite(parsedAutoLeaveMinutes) && parsedAuto
   : DEFAULT_AUTO_LEAVE_MINUTES;
 const AUTO_LEAVE_GRACE_MS = Math.round(AUTO_LEAVE_MINUTES * 60 * 1000);
 const SOUNDCLOUD_PROGRESS_REGEX = /^(📋 SoundCloud:|✅ SoundCloud:|📋 Lendo playlist do SoundCloud)/;
+
+const pendingPlayRequests = new Map();
+const deferredSkipRequests = new Map();
+const queueStatusMessages = new Map();
+
+function trackQueueStatusMessage(guildId, msg) {
+  if (!msg || typeof msg.delete !== 'function') return;
+  if (!queueStatusMessages.has(guildId)) queueStatusMessages.set(guildId, []);
+  queueStatusMessages.get(guildId).push(msg);
+}
+
+function clearQueueStatusMessages(guildId) {
+  const msgs = queueStatusMessages.get(guildId);
+  if (!msgs) return;
+  queueStatusMessages.delete(guildId);
+  for (const msg of msgs) {
+    msg.delete().catch(() => {});
+  }
+}
 
 function getHumanCount(channel) {
   if (!channel) return 0;
@@ -402,7 +440,11 @@ async function bumpActiveSoundCloudProgressForGuild(guildId, song = null) {
   await refreshNowPlayingMessage(guildId, { forceResend: true }).catch(() => {});
 }
 
-setOnSongChangedCallback((guildId, song) => bumpActiveSoundCloudProgressForGuild(guildId, song));
+setOnSongChangedCallback((guildId, song) => {
+  if (!song) clearQueueStatusMessages(guildId);
+  if (song) clearEmptyQueueMessage(guildId);
+  bumpActiveSoundCloudProgressForGuild(guildId, song);
+});
 
 function updateBotPresence(songTitle = null) {
   if (!client.user) return;
@@ -479,6 +521,83 @@ function startSpotifyLoadSession(guildId) {
   return token;
 }
 
+function beginPendingPlayRequest(guildId) {
+  pendingPlayRequests.set(guildId, (pendingPlayRequests.get(guildId) || 0) + 1);
+}
+
+function finishPendingPlayRequest(guildId) {
+  const current = pendingPlayRequests.get(guildId) || 0;
+  if (current <= 1) {
+    pendingPlayRequests.delete(guildId);
+    return;
+  }
+  pendingPlayRequests.set(guildId, current - 1);
+}
+
+function hasPendingPlayRequest(guildId) {
+  return (pendingPlayRequests.get(guildId) || 0) > 0;
+}
+
+function queueDeferredSkip(guildId) {
+  const existing = deferredSkipRequests.get(guildId);
+  deferredSkipRequests.set(guildId, { timestamp: Date.now(), notificationMessage: existing?.notificationMessage ?? null });
+}
+
+function clearDeferredSkip(guildId) {
+  const entry = deferredSkipRequests.get(guildId);
+  if (entry?.notificationMessage) {
+    entry.notificationMessage.delete().catch(() => {});
+  }
+  deferredSkipRequests.delete(guildId);
+}
+
+async function flushDeferredSkipIfReady(guildId) {
+  if (!deferredSkipRequests.has(guildId)) return false;
+
+  const { current, queue } = getQueueFull(guildId);
+  if (!current || !Array.isArray(queue) || queue.length === 0) {
+    if (!hasPendingPlayRequest(guildId)) {
+      clearDeferredSkip(guildId);
+    }
+    return false;
+  }
+
+  const entry = deferredSkipRequests.get(guildId);
+  deferredSkipRequests.delete(guildId);
+  if (entry?.notificationMessage) {
+    entry.notificationMessage.delete().catch(() => {});
+  }
+  await skip({ guildId }, () => Promise.resolve());
+  await refreshQueueMessagesForGuild(guildId, { forceCurrentSongPage: true }).catch(() => {});
+  return true;
+}
+
+async function runSkipOrDefer(
+  message,
+  replyFn = (text) => message.reply(text),
+  deferredReplyFn = replyFn
+) {
+  const { current, queue } = getQueueFull(message.guildId);
+  const waitingForIncomingTrack =
+    Boolean(current) &&
+    Array.isArray(queue) &&
+    queue.length === 0 &&
+    (hasPendingPlayRequest(message.guildId) || isPlaylistLoadInProgress(message.guildId));
+
+  if (waitingForIncomingTrack) {
+    const alreadyDeferred = deferredSkipRequests.has(message.guildId);
+    queueDeferredSkip(message.guildId);
+    if (!alreadyDeferred && typeof deferredReplyFn === 'function') {
+      const notifMsg = await deferredReplyFn('⏳ A próxima música ainda está carregando. Vou pular automaticamente assim que entrar na fila.').catch(() => null);
+      const entry = deferredSkipRequests.get(message.guildId);
+      if (entry && notifMsg) entry.notificationMessage = notifMsg;
+    }
+    return { deferred: true };
+  }
+
+  return skip(message, replyFn);
+}
+
 function isSpotifyLoadSessionActive(guildId, token) {
   return spotifyLoadSessions.get(guildId) === token;
 }
@@ -529,6 +648,7 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
   ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
 // Prefixos padrão (inclui +p, +play, +skip, +stop, +i, +efeito/+ef e +fila/+queue)
@@ -702,6 +822,38 @@ function removeFavoriteQuery(userId, query) {
   return { removed: true, index: existingIndex + 1 };
 }
 
+function getFavoriteQueryState(query) {
+  const normalized = normalizeFavQuery(query);
+  if (!normalized) return { exists: false, index: -1 };
+
+  const favs = getFavorites();
+  const existingIndex = favs.findIndex((f) => {
+    if (typeof f === 'string') return normalizeFavQuery(f) === normalized;
+    return normalizeFavQuery(f?.query) === normalized;
+  });
+
+  return {
+    exists: existingIndex >= 0,
+    index: existingIndex,
+  };
+}
+
+function getFavoriteCandidateState(candidates = []) {
+  for (const candidate of candidates) {
+    const state = getFavoriteQueryState(candidate);
+    if (state.exists) {
+      return { exists: true, index: state.index, query: String(candidate || '').trim() };
+    }
+  }
+
+  const fallback = candidates.find((candidate) => normalizeFavQuery(candidate));
+  return {
+    exists: false,
+    index: -1,
+    query: fallback ? String(fallback).trim() : '',
+  };
+}
+
 function getFavoriteEntryByIndex(userId, index1Based) {
   const favs = getFavorites(userId);
   const idx = index1Based - 1;
@@ -749,6 +901,23 @@ const pendingSfxRepeats = new Map();
 // Chave: mensagem do bot
 // Valor: { userId, timeoutId, page, message, lastSignature }
 const pendingQueueMessages = new Map();
+// Mensagem de "fila vazia" enviada por guild (1 por guild)
+const emptyQueueMessages = new Map();
+
+function trackEmptyQueueMessage(guildId, msg) {
+  if (!msg || typeof msg.delete !== 'function') return;
+  const old = emptyQueueMessages.get(guildId);
+  if (old && old.id !== msg.id) old.delete().catch(() => {});
+  emptyQueueMessages.set(guildId, msg);
+}
+
+function clearEmptyQueueMessage(guildId) {
+  const msg = emptyQueueMessages.get(guildId);
+  if (msg) {
+    emptyQueueMessages.delete(guildId);
+    msg.delete().catch(() => {});
+  }
+}
 // Mensagem de efeitos exibida com botão de descartar
 // Chave: mensagem do bot
 // Valor: { userId, timeoutId }
@@ -761,6 +930,7 @@ const guildEffectErrorMsgs = new Map();
 // Chave: mensagem do bot
 // Valor: { userId, timeoutId }
 const pendingHelpMessages = new Map();
+const instantFavoriteStatusMessages = new Map();
 function cleanupPendingSfxRepeat(messageId) {
   const entry = pendingSfxRepeats.get(messageId);
   if (!entry) return;
@@ -778,6 +948,27 @@ function cleanupPendingSfxRepeat(messageId) {
     duckReaction.remove().catch(() => {});
   }
 
+  const megaphoneReaction = entry.sourceMessage?.reactions?.cache?.find(
+    (r) => r.emoji?.name === '📢'
+  );
+  if (megaphoneReaction) {
+    megaphoneReaction.users.remove(client.user.id).catch(() => {});
+  }
+
+  const activeStarReaction = entry.sourceMessage?.reactions?.cache?.find(
+    (r) => r.emoji?.name === INSTANT_FAVORITE_ADD_EMOJI
+  );
+  if (activeStarReaction) {
+    activeStarReaction.users.remove(client.user.id).catch(() => {});
+  }
+
+  const inactiveStarReaction = entry.sourceMessage?.reactions?.cache?.find(
+    (r) => r.emoji?.name === INSTANT_FAVORITE_REMOVE_EMOJI
+  );
+  if (inactiveStarReaction) {
+    inactiveStarReaction.users.remove(client.user.id).catch(() => {});
+  }
+
   pendingSfxRepeats.delete(messageId);
 }
 
@@ -789,42 +980,214 @@ function cleanupPendingSfxRepeatsByUser(guildId, userId) {
   }
 }
 
+const INSTANT_FAVORITE_ADD_EMOJI = '⭐';
+const INSTANT_FAVORITE_REMOVE_EMOJI = '🌟';
+
+async function clearInstantFavoriteReactions(message) {
+  if (!message || !client.user?.id) return;
+
+  const addReaction = message.reactions?.cache?.find((r) => r.emoji?.name === INSTANT_FAVORITE_ADD_EMOJI);
+  if (addReaction) {
+    await addReaction.users.remove(client.user.id).catch(() => {});
+  }
+
+  const removeReaction = message.reactions?.cache?.find((r) => r.emoji?.name === INSTANT_FAVORITE_REMOVE_EMOJI);
+  if (removeReaction) {
+    await removeReaction.users.remove(client.user.id).catch(() => {});
+  }
+}
+
+async function clearInstantMegaphoneReaction(message) {
+  if (!message || !client.user?.id) return;
+
+  const megaphoneReaction = message.reactions?.cache?.find((r) => r.emoji?.name === '📢');
+  if (megaphoneReaction) {
+    await megaphoneReaction.users.remove(client.user.id).catch(() => {});
+  }
+}
+
+function getInstantFavoriteStatusKey(channelId, query) {
+  const normalized = normalizeFavQuery(query);
+  if (!channelId || !normalized) return '';
+  return `${channelId}:${normalized}`;
+}
+
+function parseInstantFavoriteStatusMessage(message) {
+  const content = String(message?.content || '').trim();
+  const match = content.match(/^(⭐ Favorito salvo|🗑️ Favorito removido) \(#(\d+)\): \*\*(.+)\*\*$/);
+  if (!match) return null;
+
+  const query = String(match[3] || '').trim();
+  const normalizedQuery = normalizeFavQuery(query);
+  if (!normalizedQuery) return null;
+
+  return {
+    kind: match[1],
+    index: Number(match[2]),
+    query,
+    normalizedQuery,
+  };
+}
+
+async function clearDuplicateFavoriteStatusMessages(channel, query, keepMessageId = null, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return [];
+
+  const normalizedQuery = normalizeFavQuery(query);
+  if (!normalizedQuery) return [];
+
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return [];
+
+  const matches = [];
+  for (const msg of fetched.values()) {
+    if (!msg || msg.author?.id !== client.user.id) continue;
+    const parsed = parseInstantFavoriteStatusMessage(msg);
+    if (!parsed || parsed.normalizedQuery !== normalizedQuery) continue;
+    matches.push(msg);
+  }
+
+  matches.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+  const keeper = keepMessageId
+    ? matches.find((msg) => msg.id === keepMessageId) || null
+    : matches[0] || null;
+
+  const tasks = [];
+  for (const msg of matches) {
+    if (keeper && msg.id === keeper.id) continue;
+    tasks.push(msg.delete().catch(() => {}));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+
+  return keeper ? [keeper] : [];
+}
+
+async function upsertFavoriteStatusMessage(commandMessage, entry, query, content) {
+  if (!commandMessage?.channel) return;
+
+  const key = getInstantFavoriteStatusKey(commandMessage.channelId, query);
+  if (!key) return;
+
+  let targetMessage = instantFavoriteStatusMessages.get(key) || null;
+
+  if (!targetMessage) {
+    const existing = await clearDuplicateFavoriteStatusMessages(commandMessage.channel, query);
+    targetMessage = existing[0] || null;
+  }
+
+  if (targetMessage && typeof targetMessage.edit === 'function') {
+    const edited = await targetMessage.edit(content).catch(() => null);
+    if (edited) {
+      instantFavoriteStatusMessages.set(key, edited);
+      entry.favoriteStatusMessage = edited;
+      await clearDuplicateFavoriteStatusMessages(commandMessage.channel, query, edited.id).catch(() => {});
+      return;
+    }
+    instantFavoriteStatusMessages.delete(key);
+  }
+
+  if (entry.favoriteStatusMessage && typeof entry.favoriteStatusMessage.edit === 'function') {
+    const edited = await entry.favoriteStatusMessage.edit(content).catch(() => null);
+    if (edited) {
+      instantFavoriteStatusMessages.set(key, edited);
+      entry.favoriteStatusMessage = edited;
+      await clearDuplicateFavoriteStatusMessages(commandMessage.channel, query, edited.id).catch(() => {});
+      return;
+    }
+  }
+
+  const msg = await commandMessage.reply(content).catch(() => null);
+  if (msg) {
+    instantFavoriteStatusMessages.set(key, msg);
+    entry.favoriteStatusMessage = msg;
+    await clearDuplicateFavoriteStatusMessages(commandMessage.channel, query, msg.id).catch(() => {});
+  }
+}
+
+async function clearFavoriteReactionFromPreviousIdenticalInstantMessages(message, { limit = 100 } = {}) {
+  if (!message?.channel?.messages?.fetch || !message?.author?.id) return;
+
+  const currentContent = String(message.content || '').trim();
+  if (!currentContent) return;
+
+  const currentInstant = inferInstantCommandFromMessage(message);
+  if (!currentInstant?.query) return;
+
+  const fetched = await message.channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const candidate of fetched.values()) {
+    if (!candidate || candidate.id === message.id) continue;
+    if (candidate.author?.id !== message.author.id) continue;
+    if (String(candidate.content || '').trim() !== currentContent) continue;
+
+    const candidateInstant = inferInstantCommandFromMessage(candidate);
+    if (!candidateInstant?.query) continue;
+    if (String(candidateInstant.query || '').trim() !== String(currentInstant.query || '').trim()) continue;
+
+    tasks.push(clearInstantFavoriteReactions(candidate));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function syncInstantFavoriteReaction(message, favoriteQuery) {
+  if (!message || typeof message.react !== 'function' || !client.user?.id) return;
+
+  const candidates = Array.isArray(favoriteQuery) ? favoriteQuery : [favoriteQuery];
+  const isFavorited = getFavoriteCandidateState(candidates).exists;
+  const desiredEmoji = isFavorited ? INSTANT_FAVORITE_REMOVE_EMOJI : INSTANT_FAVORITE_ADD_EMOJI;
+
+  await clearInstantFavoriteReactions(message);
+
+  await message.react(desiredEmoji).catch(() => {});
+}
+
 function setupSfxRepeat(
   reactionMessage,
   mp3Url,
   displayName,
   favoriteQuery = null,
   ownerUserId = null,
-  playbackMessage = null
+  playbackMessage = null,
+  commandMessageOverride = null
 ) {
   if (!reactionMessage || !mp3Url || typeof reactionMessage.createReactionCollector !== 'function') return;
 
   const actionMessage = playbackMessage || reactionMessage;
-  const commandMessage = reactionMessage;
+  const commandMessage = commandMessageOverride || reactionMessage;
   cleanupPendingSfxRepeat(reactionMessage.id);
+  const favoriteCandidates = [favoriteQuery, displayName].filter((value) => normalizeFavQuery(value));
+  const existingFavorite = getFavoriteCandidateState(favoriteCandidates);
+  const resolvedFavoriteQuery = existingFavorite.query || favoriteQuery || displayName;
 
-  const sendFavoriteFeedback = async (entry, content) => {
+  const sendFavoriteFeedback = async (entry, content, favQuery) => {
     if (!entry) return;
-
-    if (entry.favoriteStatusMessage && typeof entry.favoriteStatusMessage.edit === 'function') {
-      await entry.favoriteStatusMessage.edit(content).catch(() => {});
-      return;
-    }
-
-    const msg = await commandMessage.reply(content).catch(() => null);
-    if (msg) entry.favoriteStatusMessage = msg;
+    await upsertFavoriteStatusMessage(commandMessage, entry, favQuery, content).catch(() => {});
   };
 
-  // Adiciona reação de pato para permitir repetir.
+  // Adiciona reações na ordem garantida: 🦆 → 📢 → ⭐
   reactionMessage.react('🦆').catch(() => {});
-  // Adiciona estrela para favoritar rapidamente a busca feita em +i.
-  reactionMessage.react('⭐').catch(() => {});
+  reactionMessage.react('📢').catch(() => {});
+  clearFavoriteReactionFromPreviousIdenticalInstantMessages(reactionMessage)
+    .then(() => syncInstantFavoriteReaction(reactionMessage, favoriteCandidates))
+    .catch(() => {});
 
   const filter = (reaction, user) => {
     if (!reaction || !user) return false;
     // Ignora reações do próprio bot
     if (user.id === reactionMessage.client?.user?.id) return false;
-    return reaction.emoji.name === '🦆' || reaction.emoji.name === '⭐';
+    return (
+      reaction.emoji.name === '🦆' ||
+      reaction.emoji.name === '📢' ||
+      reaction.emoji.name === INSTANT_FAVORITE_ADD_EMOJI ||
+      reaction.emoji.name === INSTANT_FAVORITE_REMOVE_EMOJI
+    );
   };
 
   const collector = reactionMessage.createReactionCollector({ filter, dispose: true });
@@ -832,11 +1195,41 @@ function setupSfxRepeat(
     const entry = pendingSfxRepeats.get(reactionMessage.id);
     if (!entry) return;
 
-    if (reaction.emoji.name === '⭐') {
-      const favQuery = entry.favoriteQuery || entry.displayName;
-      const addResult = addFavoriteQuery(user.id, favQuery);
-      if (addResult.added) {
-        await sendFavoriteFeedback(entry, `⭐ Favorito salvo (#${addResult.index}): **${favQuery}**`);
+    if (
+      reaction.emoji.name === INSTANT_FAVORITE_ADD_EMOJI ||
+      reaction.emoji.name === INSTANT_FAVORITE_REMOVE_EMOJI
+    ) {
+      const favoriteState = getFavoriteCandidateState([entry.favoriteQuery, entry.displayName]);
+      const favQuery = favoriteState.query || entry.favoriteQuery || entry.displayName;
+      reaction.users.remove(user.id).catch(() => {});
+      if (reaction.emoji.name === INSTANT_FAVORITE_REMOVE_EMOJI && favoriteState.exists) {
+        const removeResult = removeFavoriteQuery(user.id, favQuery);
+        if (removeResult.removed) {
+          await sendFavoriteFeedback(entry, `🗑️ Favorito removido (#${removeResult.index}): **${favQuery}**`, favQuery);
+        }
+      } else if (reaction.emoji.name === INSTANT_FAVORITE_ADD_EMOJI && !favoriteState.exists) {
+        const addResult = addFavoriteQuery(user.id, favQuery);
+        if (addResult.added) {
+          await sendFavoriteFeedback(entry, `⭐ Favorito salvo (#${addResult.index}): **${favQuery}**`, favQuery);
+        }
+      }
+      await syncInstantFavoriteReaction(reactionMessage, [entry.favoriteQuery, entry.displayName]).catch(() => {});
+      return;
+    }
+
+    // Megafone: toca 2x mais alto, uma única vez
+    if (reaction.emoji.name === '📢') {
+      if (entry.megaphoneUsed) return;
+      entry.megaphoneUsed = true;
+      reaction.users.remove(user.id).catch(() => {});
+      const megaReaction = reactionMessage.reactions.cache.get('📢');
+      if (megaReaction) megaReaction.remove().catch(() => {});
+      try {
+        const tmpFile = await downloadMp3(entry.mp3Url);
+        const megaVol = Number(BOT_CFG.sfx?.megaphoneVolume) || 2.0;
+        await playSfx(entry.commandMessage || commandMessage, tmpFile, entry.displayName, megaVol);
+      } catch (err) {
+        console.error('❌ Erro ao tocar com megafone:', err);
       }
       return;
     }
@@ -862,13 +1255,10 @@ function setupSfxRepeat(
   collector.on('remove', async (reaction, user) => {
     const entry = pendingSfxRepeats.get(reactionMessage.id);
     if (!entry) return;
-    if (reaction.emoji.name !== '⭐') return;
-
-    const favQuery = entry.favoriteQuery || entry.displayName;
-    const removeResult = removeFavoriteQuery(user.id, favQuery);
-    if (removeResult.removed) {
-      await sendFavoriteFeedback(entry, `🗑️ Favorito removido (#${removeResult.index}): **${favQuery}**`);
-    }
+    if (
+      reaction.emoji.name !== INSTANT_FAVORITE_ADD_EMOJI &&
+      reaction.emoji.name !== INSTANT_FAVORITE_REMOVE_EMOJI
+    ) return;
   });
 
   collector.on('end', () => {
@@ -878,16 +1268,144 @@ function setupSfxRepeat(
   pendingSfxRepeats.set(reactionMessage.id, {
     mp3Url,
     displayName,
-    favoriteQuery,
+    favoriteQuery: resolvedFavoriteQuery,
     guildId: actionMessage.guildId,
     sourceMessage: reactionMessage,
     commandMessage,
     playbackMessage: actionMessage,
     userId: ownerUserId || actionMessage.author?.id,
     repeatInFlight: false,
+    megaphoneUsed: false,
     favoriteStatusMessage: null,
     collector,
   });
+}
+
+function inferInstantCommandFromMessage(message) {
+  const content = String(message?.content || '').trim();
+  if (!content || !message?.guildId) return null;
+
+  const prefixes = getPrefixes(message.guildId).sort((a, b) => b.length - a.length);
+  let usedPrefix = null;
+  for (const p of prefixes) {
+    if (content.toLowerCase().startsWith(p.toLowerCase())) {
+      const nextChar = content[p.length];
+      const lower = p.toLowerCase();
+      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
+      if (requiresSpace && nextChar && !/\s/.test(nextChar)) continue;
+      usedPrefix = p;
+      break;
+    }
+  }
+
+  if (!usedPrefix) return null;
+
+  const normalizedPrefix = usedPrefix.toLowerCase();
+  const args = content.slice(usedPrefix.length).trim();
+  if (!args) return null;
+
+  if (normalizedPrefix === '+i') {
+    const firstToken = args.split(/\s+/)[0];
+    return {
+      query: args,
+      directLink: MYINSTANTS_REGEX.test(firstToken) ? firstToken : null,
+    };
+  }
+
+  const parts = args.split(/\s+/);
+  const cmd = String(parts[0] || '').toLowerCase();
+  if (cmd !== 'instant' && cmd !== 'instants') return null;
+
+  const query = parts.slice(1).join(' ').trim();
+  if (!query) return null;
+
+  const firstToken = query.split(/\s+/)[0];
+  return {
+    query,
+    directLink: MYINSTANTS_REGEX.test(firstToken) ? firstToken : null,
+  };
+}
+
+function createLegacyReactionMessageAdapter(message, user) {
+  return {
+    guild: message.guild,
+    guildId: message.guildId,
+    member: message.guild?.members?.cache?.get(user.id) || null,
+    channel: message.channel,
+    author: user,
+    reactions: {
+      removeAll: () => Promise.resolve(),
+    },
+    react: () => Promise.resolve(),
+    reply: (options) => {
+      const normalized = typeof options === 'string' ? { content: options } : options;
+      return message.reply(normalized);
+    },
+  };
+}
+
+async function handleLegacyInstantReaction(reaction, user, { isRemoval = false } = {}) {
+  if (!reaction || !user || user.bot) return;
+  const emoji = reaction.emoji?.name;
+  if (emoji !== '🦆' && emoji !== INSTANT_FAVORITE_ADD_EMOJI && emoji !== INSTANT_FAVORITE_REMOVE_EMOJI) return;
+
+  try {
+    if (reaction.partial) await reaction.fetch().catch(() => null);
+    if (reaction.message?.partial) await reaction.message.fetch().catch(() => null);
+  } catch {}
+
+  const sourceMessage = reaction.message;
+  if (!sourceMessage || pendingSfxRepeats.has(sourceMessage.id)) return;
+
+  const inferred = inferInstantCommandFromMessage(sourceMessage);
+  if (!inferred?.query) return;
+
+  if (emoji === INSTANT_FAVORITE_ADD_EMOJI || emoji === INSTANT_FAVORITE_REMOVE_EMOJI) {
+    if (isRemoval) return;
+
+    reaction.users.remove(user.id).catch(() => {});
+    const favoriteState = getFavoriteCandidateState([inferred.query]);
+    if (emoji === INSTANT_FAVORITE_REMOVE_EMOJI && favoriteState.exists) {
+      removeFavoriteQuery(user.id, favoriteState.query || inferred.query);
+    } else if (emoji === INSTANT_FAVORITE_ADD_EMOJI && !favoriteState.exists) {
+      addFavoriteQuery(user.id, inferred.query);
+    }
+    await syncInstantFavoriteReaction(sourceMessage, inferred.query).catch(() => {});
+    return;
+  }
+
+  reaction.users.remove(user.id).catch(() => {});
+
+  const msgAdapter = createLegacyReactionMessageAdapter(sourceMessage, user);
+  try {
+    let mp3Url = null;
+    let displayName = inferred.query;
+
+    if (inferred.directLink) {
+      mp3Url = await extractMp3Url(inferred.directLink);
+      displayName = inferred.directLink
+        .replace(/\/$/, '')
+        .split('/')
+        .pop()
+        .replace(/-/g, ' ')
+        .replace(/\d+$/, '')
+        .trim() || inferred.query;
+    } else {
+      const results = await searchMyInstants(inferred.query, 1);
+      const picked = Array.isArray(results) ? results[0] : null;
+      if (!picked) return;
+      mp3Url = picked.mp3Url ? picked.mp3Url : await extractMp3Url(picked.pageUrl);
+      displayName = picked.title || inferred.query;
+    }
+
+    if (!mp3Url) return;
+
+    const tmpFile = await downloadMp3(mp3Url);
+    const sfxMessage = await playSfx(msgAdapter, tmpFile, displayName);
+    setupSfxRepeat(sourceMessage, mp3Url, displayName, inferred.query, user.id, sfxMessage || null, msgAdapter);
+  } catch (err) {
+    console.error('❌ Erro ao repetir instant antigo por reação:', err);
+  }
 }
 
 function cleanupPendingSelectionForUser(userId) {
@@ -908,6 +1426,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
   const requesterId = existingEntry?.userId || message?.author?.id || message?.user?.id || '0';
 
   if (!existingMessage) {
+    clearEmptyQueueMessage(message.guildId);
     const cleanupTasks = [];
     for (const [messageId, entry] of pendingQueueMessages.entries()) {
       if (!entry?.message) continue;
@@ -921,22 +1440,25 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
       await Promise.allSettled(cleanupTasks);
     }
   }
-
-  const { current, queue, history, loopPlaylist, effect, effectIntensity } = getQueueFull(message.guildId);
+  const { current, queue, history, loopPlaylist, playlistSongs, currentIndex, effect, effectIntensity } = getQueueFull(message.guildId);
   if (!current && queue.length === 0) {
     if (existingMessage && existingEntry) {
       pendingQueueMessages.delete(existingMessage.id);
       if (existingEntry.timeoutId) clearTimeout(existingEntry.timeoutId);
-      return existingMessage.edit({ content: '📋 A fila está vazia.', components: [] }).catch(() => null);
+      const edited = await existingMessage.edit({ content: '📋 A fila está vazia.', components: [] }).catch(() => null);
+      if (edited) trackEmptyQueueMessage(message.guildId, edited);
+      return edited;
     }
-    return message.reply('📋 A fila está vazia.');
+    const sent = await message.reply('📋 A fila está vazia.').catch(() => null);
+    if (sent) trackEmptyQueueMessage(message.guildId, sent);
+    return sent;
   }
 
   // Monta lista de exibição: modo normal (só fila) ou modo loop-playlist (histórico + atual + fila)
   const allSongs = loopPlaylist
-    ? [...history, ...(current ? [current] : []), ...queue]
+    ? (playlistSongs.length > 0 ? playlistSongs : [...history, ...(current ? [current] : []), ...queue])
     : queue;
-  const currentIdx = loopPlaylist ? history.length : -1;
+  const currentIdx = loopPlaylist ? currentIndex : -1;
   const displayTotal = loopPlaylist ? allSongs.length : queue.length;
 
   const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
@@ -979,6 +1501,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
 
   const components = [];
   const row = new ActionRowBuilder();
+  const playlistLoading = isPlaylistLoadInProgress(message.guildId);
 
   // Navegação de páginas
   if (normalizedPage > 0) {
@@ -987,6 +1510,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
         .setCustomId(`queue_prev_${requesterId}_${normalizedPage - 1}`)
         .setLabel('◀ Anterior')
         .setStyle(ButtonStyle.Primary)
+        .setDisabled(playlistLoading)
     );
   }
 
@@ -996,6 +1520,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
         .setCustomId(`queue_next_${requesterId}_${normalizedPage + 1}`)
         .setLabel('Próxima ▶')
         .setStyle(ButtonStyle.Primary)
+        .setDisabled(playlistLoading)
     );
   }
 
@@ -1005,6 +1530,7 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
       .setCustomId(`queue_play_${requesterId}`)
       .setLabel('Tocar (#)')
       .setStyle(ButtonStyle.Success)
+      .setDisabled(playlistLoading)
   );
 
   // Botão para descartar a mensagem
@@ -1025,12 +1551,14 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
         .setCustomId(`queue_loopplaylist_${requesterId}`)
         .setLabel('Loop Playlist')
         .setEmoji('🔄')
-        .setStyle(loopPlaylist ? ButtonStyle.Success : ButtonStyle.Secondary),
+        .setStyle(loopPlaylist ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(playlistLoading),
       new ButtonBuilder()
         .setCustomId(`queue_restart_${requesterId}`)
         .setLabel('Reiniciar')
         .setEmoji('⏮️')
-        .setStyle(ButtonStyle.Primary),
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(playlistLoading),
     );
     components.push(row2);
   }
@@ -1171,14 +1699,17 @@ async function jumpToQueue(message, position) {
   }
 
   const { queue } = getQueue(message.guildId);
-  if (!queue.length) {
+  const { loopPlaylist, playlistSongs } = getQueueFull(message.guildId);
+  const totalSongs = loopPlaylist ? playlistSongs.length : queue.length;
+
+  if (!totalSongs) {
     return message.reply('❌ A fila está vazia. Use `+fila` para ver as músicas.');
   }
   if (!Number.isFinite(position) || position < 1) {
     return message.reply('❌ Número inválido. Use um número válido da fila.');
   }
-  if (position > queue.length) {
-    return message.reply(`❌ A fila tem apenas **${queue.length}** música(s). Não existe a posição **${position}**.`);
+  if (position > totalSongs) {
+    return message.reply(`❌ A fila tem apenas **${totalSongs}** música(s). Não existe a posição **${position}**.`);
   }
 
   const success = await jumpTo(message.guildId, position);
@@ -1186,14 +1717,20 @@ async function jumpToQueue(message, position) {
     return message.reply('❌ Número inválido ou fila vazia. Use `+fila` para ver as músicas.');
   }
   await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
-  return message.reply(`▶️ Indo para a música #${position} da fila...`);
+  const sent = await message.reply(`▶️ Indo para a música #${position} da fila...`).catch(() => null);
+  if (sent) {
+    setTimeout(() => {
+      sent.delete().catch(() => {});
+    }, 10_000);
+  }
+  return sent;
 }
 
 function getCurrentSongQueuePage(guildId) {
   const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
-  const { history, loopPlaylist } = getQueueFull(guildId);
+  const { currentIndex, loopPlaylist } = getQueueFull(guildId);
   if (!loopPlaylist) return 0;
-  return Math.max(0, Math.floor((history?.length || 0) / pageSize));
+  return Math.max(0, Math.floor((Math.max(0, currentIndex)) / pageSize));
 }
 
 async function refreshQueueMessagesForGuild(guildId, opts = {}) {
@@ -1213,6 +1750,199 @@ async function refreshQueueMessagesForGuild(guildId, opts = {}) {
         pendingQueueMessages.delete(messageId);
       })
     );
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function clearQueueMessagesForGuild(guildId) {
+  const tasks = [];
+  for (const [messageId, entry] of pendingQueueMessages.entries()) {
+    if (!entry?.message || entry.message.guildId !== guildId) continue;
+    if (entry.timeoutId) clearTimeout(entry.timeoutId);
+    pendingQueueMessages.delete(messageId);
+    tasks.push(entry.message.delete().catch(() => {}));
+  }
+
+  const guild = client.guilds.cache.get(guildId);
+  if (guild) {
+    for (const channel of guild.channels.cache.values()) {
+      if (!channel || !channel.isTextBased?.() || !channel.messages?.fetch) continue;
+      tasks.push(clearQueueUiMessagesInChannel(channel).catch(() => {}));
+    }
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+const QUEUE_UI_COMPONENT_PREFIXES = [
+  'queue_dismiss_',
+  'queue_prev_',
+  'queue_next_',
+  'queue_play_',
+  'queue_loopplaylist_',
+  'queue_restart_',
+];
+
+function messageHasQueueUiComponents(msg) {
+  if (!msg || msg.author?.id !== client.user?.id) return false;
+  const rows = Array.isArray(msg.components) ? msg.components : [];
+  for (const row of rows) {
+    const comps = Array.isArray(row?.components) ? row.components : [];
+    for (const comp of comps) {
+      const cid = String(comp?.customId || '');
+      if (!cid) continue;
+      if (QUEUE_UI_COMPONENT_PREFIXES.some((prefix) => cid.startsWith(prefix))) return true;
+    }
+  }
+  return false;
+}
+
+async function clearQueueUiMessagesInChannel(channel, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return;
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const msg of fetched.values()) {
+    if (!messageHasQueueUiComponents(msg)) continue;
+    tasks.push(msg.delete().catch(() => {}));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+const NOW_PLAYING_MESSAGE_PREFIXES = ['🎶 Tocando:', '🔊 Tocando:'];
+const TRANSIENT_BOT_MESSAGE_PREFIXES = [
+  '❌ Não encontrei resultados para essa busca no YouTube.',
+  '📋 A fila está vazia.',
+];
+const STALE_UI_COMPONENT_PREFIXES = [
+  'effects_dismiss_',
+  'help_dismiss_',
+  'queue_dismiss_',
+  'queue_prev_',
+  'queue_next_',
+  'queue_play_',
+  'queue_loopplaylist_',
+  'queue_restart_',
+];
+
+function isNowPlayingLikeBotMessage(msg) {
+  if (!msg || msg.author?.id !== client.user?.id) return false;
+  const content = String(msg.content || '');
+  return NOW_PLAYING_MESSAGE_PREFIXES.some((prefix) => content.startsWith(prefix));
+}
+
+function isTransientBotMessage(msg) {
+  if (!msg || msg.author?.id !== client.user?.id) return false;
+  const content = String(msg.content || '');
+  return TRANSIENT_BOT_MESSAGE_PREFIXES.some((prefix) => content.startsWith(prefix));
+}
+
+async function clearNowPlayingMessagesInChannel(channel, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return;
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const msg of fetched.values()) {
+    if (!isNowPlayingLikeBotMessage(msg)) continue;
+    tasks.push(msg.delete().catch(() => {}));
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function clearTransientBotMessagesInChannel(channel, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return;
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const msg of fetched.values()) {
+    if (!isTransientBotMessage(msg)) continue;
+    tasks.push(msg.delete().catch(() => {}));
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function clearOldInstantMegaphonesInChannel(channel, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return;
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const msg of fetched.values()) {
+    if (!inferInstantCommandFromMessage(msg)?.query) continue;
+    tasks.push(clearInstantMegaphoneReaction(msg));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+function messageHasStaleUiComponents(msg) {
+  if (!msg || msg.author?.id !== client.user?.id) return false;
+  const rows = Array.isArray(msg.components) ? msg.components : [];
+  for (const row of rows) {
+    const comps = Array.isArray(row?.components) ? row.components : [];
+    for (const comp of comps) {
+      const cid = String(comp?.customId || '');
+      if (!cid) continue;
+      if (STALE_UI_COMPONENT_PREFIXES.some((prefix) => cid.startsWith(prefix))) return true;
+    }
+  }
+  return false;
+}
+
+async function clearStaleUiMessagesInChannel(channel, { limit = 100 } = {}) {
+  if (!channel || !channel.messages?.fetch || !client.user?.id) return;
+  const fetched = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!fetched) return;
+
+  const tasks = [];
+  for (const msg of fetched.values()) {
+    if (!messageHasStaleUiComponents(msg)) continue;
+    tasks.push(msg.delete().catch(() => {}));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function clearNowPlayingMessagesInAllGuildTextChannels() {
+  const tasks = [];
+  for (const guild of client.guilds.cache.values()) {
+    for (const channel of guild.channels.cache.values()) {
+      if (!channel || !channel.isTextBased?.() || !channel.messages?.fetch) continue;
+      tasks.push(clearNowPlayingMessagesInChannel(channel).catch(() => {}));
+      tasks.push(clearTransientBotMessagesInChannel(channel).catch(() => {}));
+      tasks.push(clearStaleUiMessagesInChannel(channel).catch(() => {}));
+    }
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+async function clearOldInstantMegaphonesInAllGuildTextChannels() {
+  const tasks = [];
+  for (const guild of client.guilds.cache.values()) {
+    for (const channel of guild.channels.cache.values()) {
+      if (!channel || !channel.isTextBased?.() || !channel.messages?.fetch) continue;
+      tasks.push(clearOldInstantMegaphonesInChannel(channel).catch(() => {}));
+    }
   }
   if (tasks.length > 0) {
     await Promise.allSettled(tasks);
@@ -1348,7 +2078,9 @@ function buildHelpEmbed() {
       {
         name: '🔍 Buscar instant (PT-BR / EN)',
         value:
-          '```\n+i <descricao do som>\n```\nExemplo: `+i briga de gato`\n💡 *Instants tocam instantaneamente, mesmo com qualquer audio tocando!*',
+          '```\n+i <descricao do som>\n```\nExemplo: `+i briga de gato`\n' +
+          '💡 *Instants tocam instantaneamente, mesmo com qualquer audio tocando!*\n' +
+          '🦆 Reaja com **🦆** para repetir • 📢 **📢** para tocar mais alto (uma vez) • ⭐ **⭐** para favoritar',
       },
       {
         name: '🎬 Tocar música por link (PT-BR / EN)',
@@ -1386,12 +2118,16 @@ function buildHelpEmbed() {
         name: '🧠 Funcionalidades',
         value:
           '• Pesquisa YouTube e MyInstants\n' +
-          '• Suporte a playlist do YouTube\n' +
+          '• Suporte a playlist do YouTube, SoundCloud e Spotify\n' +
           '• Fila com paginação e botão "Tocar (#)"\n' +
           '• Jump para posição da fila (`+fila <n>`)\n' +
           '• Efeitos com intensidade por nível\n' +
-          '• Repetição rápida de SFX via reação 🦆\n' +
-          '• Favoritar busca do +i via ⭐ e executar com `+fav`',
+            '• Repetição rápida de SFX via reação 🦆\n' +
+            '• 📢 Megafone: toca o instant mais alto (uma vez por mensagem)\n' +
+              '• 📢 Megafones antigos são limpos ao iniciar/encerrar o bot\n' +
+            '• Favoritar busca do +i via ⭐ e executar com `+fav`\n' +
+              '• Status de favorito do +i reutiliza uma única mensagem por instant\n' +
+          '• Mensagens de fila/status removidas automaticamente ao terminar',
       },
       {
         name: '⚙️ Administração',
@@ -1414,7 +2150,7 @@ function buildHelpEmbed() {
       {
         name: '👤 Créditos',
         value:
-          'Criado por **Luam Ducate** (github/luanducate)\n' +
+          'Criado por **Luan Ducate** (github/luanducate)\n' +
           'Com colaboração de **Bryan Christen** (github/bryan-christen)',
       }
     )
@@ -1440,6 +2176,17 @@ async function sendEphemeralMessage(message, content, { ephemeral = false } = {}
   if (message.channel) {
     return message.channel.send(content);
   }
+}
+
+async function sendTemporaryMessage(message, content, timeoutMs = 15_000) {
+  const sent = await message.reply(content).catch(() => null);
+  if (!sent) return null;
+
+  setTimeout(() => {
+    sent.delete().catch(() => {});
+  }, timeoutMs);
+
+  return sent;
 }
 
 function normalizeSearchTerms(query) {
@@ -1521,9 +2268,27 @@ async function handleInstantsQuery(message, query) {
 
 async function handlePlayQuery(message, query) {
   const input = query.split(/\s+/)[0];
+  beginPendingPlayRequest(message.guildId);
   clearSpotifyLoadSession(message.guildId);
+  clearQueueStatusMessages(message.guildId);
+  clearEmptyQueueMessage(message.guildId);
+  await clearNowPlayingMessagesInChannel(message.channel).catch(() => {});
 
   try {
+    const addYouTubeAndFlushDeferredSkip = async (url, title) => {
+      const result = await addYouTube(message, url, title);
+      trackQueueStatusMessage(message.guildId, result);
+      await flushDeferredSkipIfReady(message.guildId).catch(() => {});
+      return result;
+    };
+
+    const addPlaylistAndFlushDeferredSkip = async (videos, opts = {}) => {
+      const result = await addPlaylist(message, videos, opts);
+      trackQueueStatusMessage(message.guildId, result);
+      await flushDeferredSkipIfReady(message.guildId).catch(() => {});
+      return result;
+    };
+
     // Link do SoundCloud: toca diretamente via yt-dlp
     if (SOUNDCLOUD_REGEX.test(input)) {
       if (SOUNDCLOUD_SET_REGEX.test(input)) {
@@ -1562,7 +2327,7 @@ async function handlePlayQuery(message, query) {
             ? `✅ SoundCloud: **${totalAdded}** faixas adicionadas à fila!`
             : `📋 SoundCloud: **${totalAdded}** faixas carregadas... ⏳`;
 
-          await addPlaylist(message, chunk, { skipStatusMessage: true }).catch(() => null);
+          await addPlaylistAndFlushDeferredSkip(chunk, { skipStatusMessage: true }).catch(() => null);
           progressMsg = await upsertSoundCloudProgressMessage(message, statusText).catch(() => progressMsg);
 
           for (const track of chunk) {
@@ -1644,7 +2409,7 @@ async function handlePlayQuery(message, query) {
       }
 
       const title = await getYouTubeTitle(input);
-      return addYouTube(message, input, title || 'faixa do SoundCloud');
+      return await addYouTubeAndFlushDeferredSkip(input, title || 'faixa do SoundCloud');
     }
 
     // Link de faixa do Spotify: converte para busca no YouTube
@@ -1659,7 +2424,7 @@ async function handlePlayQuery(message, query) {
         return message.reply('❌ Não consegui encontrar essa faixa do Spotify no YouTube.');
       }
 
-      return addYouTube(message, resolved.url, resolved.title || `Spotify: ${spotifyQuery}`);
+      return await addYouTubeAndFlushDeferredSkip(resolved.url, resolved.title || `Spotify: ${spotifyQuery}`);
     }
 
     // Link de playlist/album do Spotify: extrai faixas e resolve para YouTube
@@ -1721,7 +2486,7 @@ async function handlePlayQuery(message, query) {
 
       let totalAdded = firstVideos.length;
       console.log(`📋 Spotify: ${totalAdded} faixa(s) resolvida(s) no lote inicial rápido.`);
-      progressMsg = await addPlaylist(message, firstVideos, {
+      progressMsg = await addPlaylistAndFlushDeferredSkip(firstVideos, {
         editMsg: progressMsg,
         statusText: `📋 Spotify: tocando! Carregando mais... (**${totalAdded}**/${totalTarget}) ⏳`,
       });
@@ -1750,7 +2515,7 @@ async function handlePlayQuery(message, query) {
         totalAdded += chunkVideos.length;
         const isFinal = i + chunkSize >= targetQueries.length;
         console.log(`📋 Spotify: +${chunkVideos.length} faixa(s) (${totalAdded}/${totalTarget}).`);
-        progressMsg = await addPlaylist(message, chunkVideos, {
+        progressMsg = await addPlaylistAndFlushDeferredSkip(chunkVideos, {
           editMsg: progressMsg,
           statusText: isFinal
             ? `✅ Spotify: **${totalAdded}** faixas adicionadas à fila!`
@@ -1787,7 +2552,7 @@ async function handlePlayQuery(message, query) {
         return message.reply('❌ Não encontrei músicas desse artista no YouTube.');
       }
 
-      return addPlaylist(message, videos);
+      return await addPlaylistAndFlushDeferredSkip(videos);
     }
 
     // Se for link do YouTube (vídeo ou playlist)
@@ -1809,22 +2574,25 @@ async function handlePlayQuery(message, query) {
           return;
         }
 
-        return addPlaylist(message, videos, { editMsg: ytProgressMsg });
+        return await addPlaylistAndFlushDeferredSkip(videos, { editMsg: ytProgressMsg });
       }
 
       const title = await getYouTubeTitle(input);
-      return addYouTube(message, input, title);
+      return await addYouTubeAndFlushDeferredSkip(input, title);
     }
 
     // Busca no YouTube por termo (padrão)
     const resolved = await resolveYouTubeSearch(query);
     if (!resolved) {
-      return message.reply('❌ Não encontrei resultados para essa busca no YouTube.');
+      return sendTemporaryMessage(message, '❌ Não encontrei resultados para essa busca no YouTube.', 15_000);
     }
-    return addYouTube(message, resolved.url, resolved.title);
+    return await addYouTubeAndFlushDeferredSkip(resolved.url, resolved.title);
   } catch (error) {
     console.error('❌ Erro:', error.message);
     return message.reply(`❌ Erro: ${error.message}`);
+  } finally {
+    finishPendingPlayRequest(message.guildId);
+    await flushDeferredSkipIfReady(message.guildId).catch(() => {});
   }
 }
 
@@ -1908,6 +2676,67 @@ async function offerMyInstantsSelections(message, searchQuery, options) {
     searchQuery,
     timeoutId,
   });
+}
+
+function parseMyInstantsTitleFromSelectionContent(content, index) {
+  const safeIndex = Number(index);
+  if (!Number.isFinite(safeIndex) || safeIndex < 0) return null;
+  const lineNumber = safeIndex + 1;
+  const text = String(content || '');
+  const lines = text.split(/\r?\n/);
+  const marker = `**${lineNumber}.**`;
+  const line = lines.find((l) => l.trim().startsWith(marker));
+  if (!line) return null;
+  return line.replace(marker, '').trim() || null;
+}
+
+async function playMyInstantsFromLegacyButton(interaction, index) {
+  const inferredTitle = parseMyInstantsTitleFromSelectionContent(interaction.message?.content, index);
+  if (!inferredTitle) {
+    return interaction.update({ content: '⏳ Seleção expirada. Tente novamente.', components: [] }).catch(() => {});
+  }
+
+  await interaction.deferUpdate().catch(() => {});
+
+  const msgAdapter = {
+    guild: interaction.guild,
+    guildId: interaction.guildId,
+    member: interaction.member,
+    channel: interaction.channel,
+    author: interaction.user,
+    reply: (options) => {
+      const normalized = typeof options === 'string' ? { content: options } : options;
+      return interaction.channel.send(normalized);
+    },
+  };
+
+  const found = await searchMyInstants(inferredTitle, 1).catch(() => []);
+  if (!found.length) {
+    return interaction.followUp({ content: '❌ Não consegui reproduzir esse instant antigo. Tente buscar de novo com `+i`.', ephemeral: true }).catch(() => {});
+  }
+
+  const picked = found[0];
+  try {
+    const mp3Url = picked.mp3Url ? picked.mp3Url : await extractMp3Url(picked.pageUrl);
+    const tmpFile = await downloadMp3(mp3Url);
+    const sfxMessage = await playSfx(msgAdapter, tmpFile, picked.title || inferredTitle);
+    setupSfxRepeat(
+      interaction.message,
+      mp3Url,
+      picked.title || inferredTitle,
+      inferredTitle,
+      interaction.user?.id,
+      sfxMessage || null,
+      msgAdapter
+    );
+    return interaction.followUp({
+      content: `✅ Instant antigo reproduzido: **${picked.title || inferredTitle}**. O pato/estrela voltaram a funcionar nessa mensagem.`,
+      ephemeral: true,
+    }).catch(() => {});
+  } catch (err) {
+    console.error('❌ Erro ao reproduzir instant antigo:', err);
+    return interaction.followUp({ content: '❌ Não foi possível reproduzir esse instant antigo.', ephemeral: true }).catch(() => {});
+  }
 }
 
 // ============================================================
@@ -2038,9 +2867,19 @@ function onClientReady() {
   updateBotPresence(null);
   loadPrefixes();
   registerSlashCommands();
+  clearNowPlayingMessagesInAllGuildTextChannels().catch(() => {});
+  clearOldInstantMegaphonesInAllGuildTextChannels().catch(() => {});
 }
 
 client.once('clientReady', onClientReady);
+client.on('messageReactionAdd', async (reaction, user) => {
+  await handleLegacyInstantReaction(reaction, user, { isRemoval: false }).catch(() => {});
+});
+
+client.on('messageReactionRemove', async (reaction, user) => {
+  await handleLegacyInstantReaction(reaction, user, { isRemoval: true }).catch(() => {});
+});
+
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const guild = newState.guild || oldState.guild;
   if (!guild || !client.user) return;
@@ -2095,33 +2934,40 @@ client.on('messageCreate', async (message) => {
   // Suporte a comandos como +skip / +stop sem precisar do +d
   const normalizedPrefix = usedPrefix.toLowerCase();
   if (normalizedPrefix === '+skip') {
-    const result = await skip(message);
+    const result = await runSkipOrDefer(message);
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
   if (normalizedPrefix === '+stop') {
     clearSpotifyLoadSession(message.guildId);
+    clearDeferredSkip(message.guildId);
     const result = await stop(message);
     updateBotPresence(null);
+    await clearQueueMessagesForGuild(message.guildId).catch(() => {});
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
   if (normalizedPrefix === '+parar') {
     clearSpotifyLoadSession(message.guildId);
+    clearDeferredSkip(message.guildId);
     const result = await stop(message);
     updateBotPresence(null);
+    await clearQueueMessagesForGuild(message.guildId).catch(() => {});
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
   if (normalizedPrefix === '+pular') {
-    const result = await skip(message);
+    const result = await runSkipOrDefer(message);
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
   if (normalizedPrefix === '+sair' || normalizedPrefix === '+leave') {
     clearSpotifyLoadSession(message.guildId);
+    clearDeferredSkip(message.guildId);
     const result = leave(message);
     updateBotPresence(null);
+    await clearQueueMessagesForGuild(message.guildId).catch(() => {});
+    await clearNowPlayingMessagesInChannel(message.channel).catch(() => {});
     return result;
   }
   if (normalizedPrefix === '+ajuda') return sendDismissableHelpMessage(message);
@@ -2316,14 +3162,21 @@ client.on('messageCreate', async (message) => {
     // Mesmo efeito ativo sem nova intensidade = sem mudança
     if (currentEffect === effect && intensity === null) {
       clearEffectErrorMessage(message.guildId);
-      return message.reply(`ℹ️ O efeito **${effect}** já está ativo (intensidade ${currentIntensity}/10). Use \`+efeito ${effect} <1-10>\` ou \`+ef ${effect} <1-10>\` para mudar a intensidade.`);
+      return sendTimedEffectConfirm(
+        message,
+        message.guildId,
+        `ℹ️ O efeito **${effect}** já está ativo (intensidade ${currentIntensity}/10). Use \`+efeito ${effect} <1-10>\` ou \`+ef ${effect} <1-10>\` para mudar a intensidade.`
+      );
     }
 
     setEffect(message.guildId, effect);
     const appliedNow = applyEffectNow(message.guildId);
     const supportsIntensity = effectSupportsIntensity(effect);
     const effectiveIntensity = getEffectIntensity(message.guildId);
-    return message.reply(
+    clearEffectErrorMessage(message.guildId);
+    return sendTimedEffectConfirm(
+      message,
+      message.guildId,
       appliedNow
         ? supportsIntensity
           ? `✅ Efeito **${effect}** (intensidade ${effectiveIntensity}/10) ativado e aplicado imediatamente.`
@@ -2374,8 +3227,10 @@ client.on('messageCreate', async (message) => {
       return message.reply('ℹ️ Use `+stop` ou `+parar` (sem `+p`).');
     }
     clearSpotifyLoadSession(message.guildId);
+    clearDeferredSkip(message.guildId);
     const result = await stop(message, (text) => sendEphemeralMessage(message, text));
     updateBotPresence(null);
+    await clearQueueMessagesForGuild(message.guildId).catch(() => {});
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
@@ -2384,15 +3239,22 @@ client.on('messageCreate', async (message) => {
       return message.reply('ℹ️ Use `+sair` ou `+leave` (sem `+p`).');
     }
     clearSpotifyLoadSession(message.guildId);
+    clearDeferredSkip(message.guildId);
     const result = leave(message);
     updateBotPresence(null);
+    await clearQueueMessagesForGuild(message.guildId).catch(() => {});
+    await clearNowPlayingMessagesInChannel(message.channel).catch(() => {});
     return result;
   }
   if (cmd === 'skip' || cmd === 'pular') {
     if (normalizedPrefix === '+p') {
       return message.reply('ℹ️ Use `+skip` ou `+pular` (sem `+p`).');
     }
-    const result = await skip(message, (text) => sendEphemeralMessage(message, text));
+    const result = await runSkipOrDefer(
+      message,
+      (text) => sendEphemeralMessage(message, text),
+      (text) => sendEphemeralMessage(message, text)
+    );
     await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return result;
   }
@@ -2497,15 +3359,21 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (cmd === 'skip') {
-      const result = await skip(msg, (text) => msg.reply({ content: text, ephemeral: true }));
+      const result = await runSkipOrDefer(
+        msg,
+        (text) => msg.reply({ content: text, ephemeral: true }),
+        (text) => interaction.reply({ content: text, ephemeral: true })
+      );
       await refreshQueueMessagesForGuild(msg.guildId).catch(() => {});
       return result;
     }
 
     if (cmd === 'stop') {
       clearSpotifyLoadSession(msg.guildId);
+      clearDeferredSkip(msg.guildId);
       const result = await stop(msg, (text) => msg.reply({ content: text, ephemeral: true }));
       updateBotPresence(null);
+      await clearQueueMessagesForGuild(msg.guildId).catch(() => {});
       await refreshQueueMessagesForGuild(msg.guildId).catch(() => {});
       return result;
     }
@@ -2613,8 +3481,11 @@ client.on('interactionCreate', async (interaction) => {
 
     if (cmd === 'leave') {
       clearSpotifyLoadSession(msg.guildId);
+      clearDeferredSkip(msg.guildId);
       const result = leave(msg);
       updateBotPresence(null);
+      await clearQueueMessagesForGuild(msg.guildId).catch(() => {});
+      await clearNowPlayingMessagesInChannel(msg.channel).catch(() => {});
       return result;
     }
 
@@ -2652,12 +3523,14 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const { queue } = getQueue(interaction.guildId);
-    if (!queue.length) {
+    const { loopPlaylist, playlistSongs } = getQueueFull(interaction.guildId);
+    const totalSongs = loopPlaylist ? playlistSongs.length : queue.length;
+    if (!totalSongs) {
       return interaction.reply({ content: '❌ A fila está vazia.', ephemeral: true });
     }
-    if (position > queue.length) {
+    if (position > totalSongs) {
       return interaction.reply({
-        content: `❌ A fila tem apenas **${queue.length}** música(s). Não existe a posição **${position}**.`,
+        content: `❌ A fila tem apenas **${totalSongs}** música(s). Não existe a posição **${position}**.`,
         ephemeral: true,
       });
     }
@@ -2670,7 +3543,11 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
-    return interaction.editReply(`▶️ Indo para a música #${position} da fila...`);
+    await interaction.editReply(`▶️ Indo para a música #${position} da fila...`);
+    setTimeout(() => {
+      interaction.deleteReply().catch(() => {});
+    }, 10_000);
+    return;
   }
 
   // Interações (botões)
@@ -2691,6 +3568,9 @@ client.on('interactionCreate', async (interaction) => {
 
   // ---- Controles de música (⏮️ ⏹️ ⏭️ 🔁) ----
   if (interaction.customId.startsWith('music_prev_')) {
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar este comando.', ephemeral: true });
+    }
     const msgAdapter = createInteractionMessageAdapter(interaction);
     const success = playPrevious(msgAdapter);
     if (!success) {
@@ -2704,15 +3584,24 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferUpdate();
     const msgAdapter = createInteractionMessageAdapter(interaction);
     clearSpotifyLoadSession(msgAdapter.guildId);
+    clearDeferredSkip(msgAdapter.guildId);
     await stop(msgAdapter, () => Promise.resolve());
+    await clearQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
     await refreshQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
+    await clearNowPlayingMessagesInChannel(interaction.channel).catch(() => {});
     return;
   }
 
   if (interaction.customId.startsWith('music_skip_')) {
-    await interaction.deferUpdate();
     const msgAdapter = createInteractionMessageAdapter(interaction);
-    await skip(msgAdapter, () => Promise.resolve());
+    const result = await runSkipOrDefer(
+      msgAdapter,
+      () => Promise.resolve(),
+      (text) => interaction.reply({ content: text, ephemeral: true })
+    );
+    if (!result?.deferred) {
+      await interaction.deferUpdate();
+    }
     await refreshQueueMessagesForGuild(msgAdapter.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return;
   }
@@ -2726,11 +3615,11 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.customId.startsWith('myinstants_')) {
     const entry = pendingMyInstantsSelection.get(interaction.user.id);
+    const index = Number(interaction.customId.split('_')[1]);
     if (!entry || entry.messageId !== interaction.message.id) {
-      return interaction.update({ content: '⏳ Seleção expirada. Tente novamente.', components: [] }).catch(() => {});
+      return playMyInstantsFromLegacyButton(interaction, index);
     }
 
-    const index = Number(interaction.customId.split('_')[1]);
     const choice = entry.options[index];
     if (!choice) {
       return interaction.reply({ content: 'Opção inválida.', ephemeral: true });
@@ -2793,19 +3682,31 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.customId.startsWith('queue_prev_') || interaction.customId.startsWith('queue_next_')) {
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar navegação da fila.',
+        ephemeral: true,
+      });
+    }
+
     const parts = interaction.customId.split('_');
     const nextPage = Number(parts[3]);
     const entry = pendingQueueMessages.get(interaction.message.id);
     if (!entry) return interaction.deferUpdate();
 
+    // Responde imediatamente ao Discord
+    await interaction.deferUpdate();
+
     // Atualiza a mensagem com a próxima página
     await showQueueMessage(interaction.message, nextPage, interaction.message);
-    return interaction.deferUpdate();
   }
 
   if (interaction.customId.startsWith('queue_loopplaylist_')) {
     const entry = pendingQueueMessages.get(interaction.message.id);
     if (!entry) return interaction.deferUpdate();
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Loop Playlist.', ephemeral: true });
+    }
     await interaction.deferUpdate().catch(() => {});
     const loopInfo = toggleLoopPlaylist(interaction.guildId);
     // Se ativou loop, navegar para a página da música atual com índice preciso
@@ -2836,6 +3737,9 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.customId.startsWith('queue_play_')) {
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).', ephemeral: true });
+    }
     const modal = new ModalBuilder()
       .setCustomId('queue_play_modal')
       .setTitle('Tocar música da fila')

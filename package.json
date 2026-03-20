@@ -1,6 +1,6 @@
 {
   "name": "botducz",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Bot Discord de audio para canais de voz: MyInstants, YouTube, SoundCloud e Spotify com fila, efeitos e favoritos compartilhados",
   "main": "index.js",
   "scripts": {
