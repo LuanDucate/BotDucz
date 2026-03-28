@@ -52,6 +52,10 @@ const {
   leave,
   getQueue,
   getQueueFull,
+  getPlaylistSnapshot,
+  restorePlaylistSnapshot,
+  removeCurrentSong,
+  removeQueuePosition,
   jumpTo,
   getEffectList,
   getIntensityEffectList,
@@ -209,6 +213,11 @@ async function shutdownBot() {
     cleanupPendingSfxRepeat(messageId);
   }
 
+  for (const guildId of Array.from(queueStatusMessages.keys())) {
+    clearQueueStatusMessages(guildId);
+  }
+
+  await clearNowPlayingMessagesInAllGuildTextChannels().catch(() => {});
   await clearOldInstantMegaphonesInAllGuildTextChannels().catch(() => {});
 
   try {
@@ -254,11 +263,38 @@ const SOUNDCLOUD_PROGRESS_REGEX = /^(📋 SoundCloud:|✅ SoundCloud:|📋 Lendo
 const pendingPlayRequests = new Map();
 const deferredSkipRequests = new Map();
 const queueStatusMessages = new Map();
+const queueStatusMessageTimers = new Map();
+
+function removeTrackedQueueStatusMessage(guildId, messageId) {
+  const msgs = queueStatusMessages.get(guildId);
+  if (!msgs) return;
+  const next = msgs.filter((m) => m && m.id !== messageId);
+  if (next.length === 0) {
+    queueStatusMessages.delete(guildId);
+    return;
+  }
+  queueStatusMessages.set(guildId, next);
+}
 
 function trackQueueStatusMessage(guildId, msg) {
-  if (!msg || typeof msg.delete !== 'function') return;
+  if (!msg || !msg.id || typeof msg.delete !== 'function') return;
   if (!queueStatusMessages.has(guildId)) queueStatusMessages.set(guildId, []);
-  queueStatusMessages.get(guildId).push(msg);
+
+  const current = queueStatusMessages.get(guildId);
+  if (!current.some((m) => m?.id === msg.id)) {
+    current.push(msg);
+  }
+
+  const prevTimer = queueStatusMessageTimers.get(msg.id);
+  if (prevTimer) clearTimeout(prevTimer);
+
+  // Mensagens de status de adição na fila devem sumir sozinhas rapidamente.
+  const timeoutId = setTimeout(() => {
+    queueStatusMessageTimers.delete(msg.id);
+    removeTrackedQueueStatusMessage(guildId, msg.id);
+    msg.delete().catch(() => {});
+  }, 5000);
+  queueStatusMessageTimers.set(msg.id, timeoutId);
 }
 
 function clearQueueStatusMessages(guildId) {
@@ -266,6 +302,11 @@ function clearQueueStatusMessages(guildId) {
   if (!msgs) return;
   queueStatusMessages.delete(guildId);
   for (const msg of msgs) {
+    const t = queueStatusMessageTimers.get(msg?.id);
+    if (t) {
+      clearTimeout(t);
+      queueStatusMessageTimers.delete(msg.id);
+    }
     msg.delete().catch(() => {});
   }
 }
@@ -430,13 +471,28 @@ async function upsertSoundCloudProgressMessage(message, content, opts = {}) {
 async function bumpActiveSoundCloudProgressForGuild(guildId, song = null) {
   updateBotPresence(song?.title || null);
   const entry = activeSoundCloudProgressMessages.get(guildId);
+  const loadingInProgress = isPlaylistLoadInProgress(guildId);
+
+  // Se não há carregamento ativo, limpamos qualquer progresso residual para
+  // evitar que a mensagem "...carregadas ⏳" reapareça a cada troca de faixa.
+  if (!loadingInProgress) {
+    if (entry?.message) {
+      await entry.message.delete().catch(() => {});
+    }
+    activeSoundCloudProgressMessages.delete(guildId);
+    soundCloudProgressRenderPromises.delete(guildId);
+    soundCloudProgressAnchorMessageIds.delete(guildId);
+    await refreshNowPlayingMessage(guildId).catch(() => {});
+    return;
+  }
+
   if (!entry?.message || !entry?.content || !String(entry.content).includes('⏳')) {
-    await refreshNowPlayingMessage(guildId, { forceResend: true }).catch(() => {});
+    await refreshNowPlayingMessage(guildId).catch(() => {});
     return;
   }
 
   await upsertSoundCloudProgressMessage(entry.message, entry.content, { forceResend: true }).catch(() => {});
-  await refreshNowPlayingMessage(guildId, { forceResend: true }).catch(() => {});
+  await refreshNowPlayingMessage(guildId).catch(() => {});
 }
 
 setOnSongChangedCallback((guildId, song) => {
@@ -653,7 +709,7 @@ const client = new Client({
 // Prefixos padrão (inclui +p, +play, +skip, +stop, +i, +efeito/+ef e +fila/+queue)
 const DEFAULT_PREFIXES = Array.isArray(BOT_CFG.commands?.defaultPrefixes)
   ? BOT_CFG.commands.defaultPrefixes
-  : ['+Ducz', '+d', '+p', '+play', '+tocar', '+skip', '+pular', '+stop', '+parar', '+sair', '+leave', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help', '+ajuda', '+prefix'];
+  : ['+Ducz', '+d', '+p', '+play', '+tocar', '+skip', '+pular', '+stop', '+parar', '+sair', '+leave', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+remove', '+rm', '+playlist', '+pl', '+clear', '+help', '+ajuda', '+prefix'];
 
 // IDs de usuário (Discord) autorizados a usar +killbot
 // Adicione aqui outros IDs separados por vírgula, se quiser.
@@ -716,6 +772,106 @@ function removePrefix(guildId, prefix) {
 function setPrefixes(guildId, prefixes) {
   guildPrefixes[guildId] = prefixes;
   savePrefixes();
+}
+
+// Playlists salvas por guild (persistidas em savedPlaylists.json)
+const savedPlaylistsFilePath = path.join(__dirname, 'savedPlaylists.json');
+let savedPlaylistsByGuild = {};
+const activeLoadedPlaylistByGuild = new Map();
+
+function normalizePlaylistName(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
+function loadSavedPlaylists() {
+  try {
+    const raw = fs.readFileSync(savedPlaylistsFilePath, 'utf-8');
+    const parsed = JSON.parse(raw || '{}');
+    savedPlaylistsByGuild = parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    savedPlaylistsByGuild = {};
+  }
+}
+
+function saveSavedPlaylists() {
+  try {
+    fs.writeFileSync(savedPlaylistsFilePath, JSON.stringify(savedPlaylistsByGuild, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Erro ao salvar savedPlaylists.json:', err.message);
+  }
+}
+
+function getSavedPlaylistsForGuild(guildId) {
+  const key = String(guildId || '');
+  if (!savedPlaylistsByGuild[key] || typeof savedPlaylistsByGuild[key] !== 'object') {
+    savedPlaylistsByGuild[key] = {};
+  }
+  return savedPlaylistsByGuild[key];
+}
+
+function listSavedPlaylistEntries(guildId) {
+  const guildStore = getSavedPlaylistsForGuild(guildId);
+  return Object.entries(guildStore)
+    .map(([storageName, entry]) => ({ storageName, entry }))
+    .sort((a, b) => {
+      const ta = Date.parse(a.entry?.updatedAt || '') || 0;
+      const tb = Date.parse(b.entry?.updatedAt || '') || 0;
+      return tb - ta;
+    });
+}
+
+function getSavedPlaylistEntry(guildId, rawName) {
+  const name = normalizePlaylistName(rawName);
+  if (!name) return null;
+  const guildStore = getSavedPlaylistsForGuild(guildId);
+  const entry = guildStore[name];
+  if (!entry || typeof entry !== 'object') return null;
+  return { name, entry };
+}
+
+function upsertSavedPlaylist(guildId, rawName, snapshot) {
+  const name = normalizePlaylistName(rawName);
+  if (!name) return { ok: false, reason: 'invalid-name' };
+  if (!snapshot || typeof snapshot !== 'object') return { ok: false, reason: 'invalid-snapshot' };
+
+  const guildStore = getSavedPlaylistsForGuild(guildId);
+  guildStore[name] = {
+    name,
+    updatedAt: new Date().toISOString(),
+    snapshot,
+  };
+  saveSavedPlaylists();
+  return { ok: true, name, entry: guildStore[name] };
+}
+
+function deleteSavedPlaylist(guildId, rawName) {
+  const name = normalizePlaylistName(rawName);
+  if (!name) return false;
+  const guildStore = getSavedPlaylistsForGuild(guildId);
+  if (!Object.prototype.hasOwnProperty.call(guildStore, name)) return false;
+  delete guildStore[name];
+  saveSavedPlaylists();
+  return true;
+}
+
+function setActiveLoadedPlaylist(guildId, playlistName) {
+  const gid = String(guildId || '');
+  const normalized = normalizePlaylistName(playlistName);
+  if (!gid || !normalized) return;
+  activeLoadedPlaylistByGuild.set(gid, normalized);
+}
+
+function clearActiveLoadedPlaylist(guildId) {
+  const gid = String(guildId || '');
+  if (!gid) return;
+  activeLoadedPlaylistByGuild.delete(gid);
+}
+
+function getActiveLoadedPlaylist(guildId) {
+  const gid = String(guildId || '');
+  if (!gid) return null;
+  const value = activeLoadedPlaylistByGuild.get(gid);
+  return value || null;
 }
 
 // Favoritos do MyInstants (persistidos em favorites.json)
@@ -880,6 +1036,7 @@ function removeFavorite(userId, index) {
 }
 
 loadFavorites();
+loadSavedPlaylists();
 startQueueLiveRefresh();
 
 // Mapa temporário de escolhas de sugestões do MyInstants
@@ -902,6 +1059,32 @@ const pendingSfxRepeats = new Map();
 const pendingQueueMessages = new Map();
 // Mensagem de "fila vazia" enviada por guild (1 por guild)
 const emptyQueueMessages = new Map();
+
+function ensureQueueInteractionState(interaction, pageHint = null) {
+  const msg = interaction?.message;
+  if (!msg?.id) return null;
+
+  const existing = pendingQueueMessages.get(msg.id);
+  if (existing?.timeoutId) clearTimeout(existing.timeoutId);
+
+  const idParts = String(interaction.customId || '').split('_');
+  const requesterId = existing?.userId || idParts[2] || interaction.user?.id || '0';
+  const page = Number.isFinite(Number(pageHint)) ? Number(pageHint) : (existing?.page || 0);
+  const timeoutId = setTimeout(() => {
+    pendingQueueMessages.delete(msg.id);
+  }, Number(BOT_CFG.ui?.dismissTimeoutMs) || 5 * 60 * 1000);
+
+  const nextEntry = {
+    userId: requesterId,
+    timeoutId,
+    page,
+    message: msg,
+    lastSignature: existing?.lastSignature || null,
+  };
+
+  pendingQueueMessages.set(msg.id, nextEntry);
+  return nextEntry;
+}
 
 function trackEmptyQueueMessage(guildId, msg) {
   if (!msg || typeof msg.delete !== 'function') return;
@@ -1290,7 +1473,7 @@ function inferInstantCommandFromMessage(message) {
     if (content.toLowerCase().startsWith(p.toLowerCase())) {
       const nextChar = content[p.length];
       const lower = p.toLowerCase();
-      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
+      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+remove', '+rm', '+playlist', '+pl', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
       if (requiresSpace && nextChar && !/\s/.test(nextChar)) continue;
       usedPrefix = p;
       break;
@@ -1464,6 +1647,11 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
   const totalPages = Math.max(1, Math.ceil(displayTotal / pageSize));
   const normalizedPage = Math.min(Math.max(0, page), totalPages - 1);
   const effectLabel = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
+  const activeSavedPlaylistName = getActiveLoadedPlaylist(message.guildId);
+  const savedPlaylistsCount = listSavedPlaylistEntries(message.guildId).length;
+  const restartSongTotal = loopPlaylist
+    ? allSongs.length
+    : ((current ? 1 : 0) + queue.length);
 
   let text = '';
   if (loopPlaylist) {
@@ -1497,6 +1685,11 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
       }
     }
   }
+
+  if (activeSavedPlaylistName) {
+    text += `\n\n💾 **Playlist carregada:** ${activeSavedPlaylistName}`;
+  }
+  text += `\n💽 **Playlists salvas:** ${savedPlaylistsCount}`;
 
   const components = [];
   const row = new ActionRowBuilder();
@@ -1532,12 +1725,22 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
       .setDisabled(playlistLoading)
   );
 
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(`queue_remove_pick_${requesterId}`)
+      .setLabel('Remover (#)')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(playlistLoading || displayTotal === 0)
+  );
+
   // Botão para descartar a mensagem
   row.addComponents(
     new ButtonBuilder()
-      .setCustomId(`queue_dismiss_${requesterId}`)
-      .setLabel('Descartar')
-      .setStyle(ButtonStyle.Secondary)
+      .setCustomId(`queue_restart_${requesterId}`)
+      .setLabel('Reiniciar')
+      .setEmoji('⏮️')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(playlistLoading || restartSongTotal <= 1)
   );
 
   components.push(row);
@@ -1551,18 +1754,59 @@ async function showQueueMessage(message, page = 0, existingMessage = null) {
         .setLabel('Loop Playlist')
         .setEmoji('🔄')
         .setStyle(loopPlaylist ? ButtonStyle.Success : ButtonStyle.Secondary)
-        .setDisabled(playlistLoading),
-      new ButtonBuilder()
-        .setCustomId(`queue_restart_${requesterId}`)
-        .setLabel('Reiniciar')
-        .setEmoji('⏮️')
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(playlistLoading),
+        .setDisabled(playlistLoading)
     );
+
+    if (activeSavedPlaylistName) {
+      row2.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`queue_update_current_${requesterId}`)
+          .setLabel('Atualizar Playlist')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(playlistLoading),
+        new ButtonBuilder()
+          .setCustomId(`queue_saved_delete_${requesterId}`)
+          .setLabel('Apagar Playlist')
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(playlistLoading)
+      );
+    }
     components.push(row2);
+
+    const row3 = new ActionRowBuilder();
+    if (!activeSavedPlaylistName) {
+      row3.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`queue_save_pick_${requesterId}`)
+          .setLabel('Salvar Playlist')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(playlistLoading)
+      );
+    }
+    row3.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`queue_saved_load_pick_${requesterId}`)
+        .setLabel('Carregar salva (#/nome)')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(savedPlaylistsCount === 0),
+      new ButtonBuilder()
+        .setCustomId(`queue_saved_list_${requesterId}`)
+        .setLabel('Playlists salvas')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`queue_saved_delete_pick_${requesterId}`)
+        .setLabel('Apagar salva (#/nome)')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(savedPlaylistsCount === 0),
+      new ButtonBuilder()
+        .setCustomId(`queue_dismiss_${requesterId}`)
+        .setLabel('Descartar')
+        .setStyle(ButtonStyle.Secondary)
+    );
+    components.push(row3);
   }
 
-  const signature = `${normalizedPage}|${current?.title || ''}|${queue.length}|${text}`;
+  const signature = `${normalizedPage}|${current?.title || ''}|${queue.length}|${playlistLoading ? 1 : 0}|${text}`;
   if (existingMessage && existingEntry?.lastSignature === signature) {
     return existingMessage;
   }
@@ -1725,6 +1969,188 @@ async function jumpToQueue(message, position) {
   return sent;
 }
 
+async function removeQueuePositionByCommand(message, position) {
+  if (isPlaylistLoadInProgress(message.guildId)) {
+    return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para usar remoção por número.');
+  }
+
+  const { queue } = getQueue(message.guildId);
+  const { loopPlaylist, playlistSongs } = getQueueFull(message.guildId);
+  const totalSongs = loopPlaylist ? playlistSongs.length : queue.length;
+
+  if (!totalSongs) {
+    return message.reply('❌ A fila está vazia. Use `+fila` para ver as músicas.');
+  }
+
+  if (!Number.isFinite(position) || position < 1) {
+    return message.reply('❌ Número inválido. Use um número válido da fila.');
+  }
+
+  if (position > totalSongs) {
+    return message.reply(`❌ A fila tem apenas **${totalSongs}** música(s). Não existe a posição **${position}**.`);
+  }
+
+  const result = await removeQueuePosition(message.guildId, position);
+  if (!result?.ok) {
+    return message.reply('❌ Não consegui remover essa música. Tente abrir `+fila` novamente.');
+  }
+
+  await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+  if (result.removedCurrent) {
+    await refreshNowPlayingMessage(message.guildId, { forceResend: true }).catch(() => {});
+  }
+
+  const removedTitle = result.removedSong?.title || 'música';
+  return message.reply(`🗑️ Removida a música #${position}: **${removedTitle}**.`);
+}
+
+async function removeCurrentSongByCommand(message) {
+  if (isPlaylistLoadInProgress(message.guildId)) {
+    return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para remover a música atual.');
+  }
+
+  const result = await removeCurrentSong(message.guildId);
+  if (!result?.ok) {
+    return message.reply('❌ Não há música atual tocando para remover.');
+  }
+
+  await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+  await refreshNowPlayingMessage(message.guildId, { forceResend: true }).catch(() => {});
+
+  const removedTitle = result.removedSong?.title || 'música';
+  return message.reply(`🗑️ Música atual removida: **${removedTitle}**.`);
+}
+
+async function handlePlaylistCommand(message, rawArgs) {
+  const raw = String(rawArgs || '').trim();
+  if (!raw) {
+    return message.reply(
+      '💾 Uso de playlist salva:\n' +
+      '`+playlist listar`\n' +
+      '`+playlist salvar <nome>`\n' +
+      '`+playlist carregar <nome|numero>`\n' +
+      '`+playlist atualizar <nome>`\n' +
+      '`+playlist apagar <nome|numero>`\n' +
+      'Atalho: `+pl ...`'
+    );
+  }
+
+  const parts = raw.split(/\s+/);
+  const action = (parts[0] || '').toLowerCase();
+  const playlistName = parts.slice(1).join(' ').trim();
+  const actionAliases = {
+    list: ['listar', 'list', 'ls'],
+    save: ['salvar', 'save'],
+    load: ['carregar', 'load'],
+    update: ['atualizar', 'update'],
+    delete: ['apagar', 'delete', 'del', 'remover', 'remove'],
+  };
+
+  const isAction = (group) => actionAliases[group].includes(action);
+
+  if (isAction('list')) {
+    const entries = listSavedPlaylistEntries(message.guildId);
+    if (!entries.length) {
+      return message.reply('💾 Nenhuma playlist salva neste servidor.');
+    }
+    const lines = entries.slice(0, 20).map(({ storageName, entry }, idx) => {
+      const when = entry?.updatedAt ? `<t:${Math.floor(new Date(entry.updatedAt).getTime() / 1000)}:R>` : 'sem data';
+      return `**${idx + 1}.** ${storageName} (${when})`;
+    });
+    return message.reply(`💾 **Playlists salvas**\n${lines.join('\n')}`);
+  }
+
+  if (!playlistName) {
+    return message.reply('❌ Informe o nome da playlist. Ex: `+playlist salvar academia`');
+  }
+
+  if (isAction('save')) {
+    if (isPlaylistLoadInProgress(message.guildId)) {
+      return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para salvar.');
+    }
+    const existing = getSavedPlaylistEntry(message.guildId, playlistName);
+    if (existing) {
+      return message.reply('⚠️ Já existe playlist com esse nome. Use `+playlist atualizar <nome>` para sobrescrever.');
+    }
+    const snapshot = getPlaylistSnapshot(message.guildId);
+    if (!snapshot) {
+      return message.reply('❌ Não há playlist/fila ativa para salvar agora.');
+    }
+    const saved = upsertSavedPlaylist(message.guildId, playlistName, snapshot);
+    if (!saved.ok) return message.reply('❌ Não consegui salvar essa playlist.');
+    const total = (snapshot.currentSong ? 1 : 0) + (Array.isArray(snapshot.queue) ? snapshot.queue.length : 0);
+    return message.reply(`✅ Playlist **${saved.name}** salva com **${total}** música(s).`);
+  }
+
+  if (isAction('update')) {
+    if (isPlaylistLoadInProgress(message.guildId)) {
+      return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para atualizar.');
+    }
+    const existing = getSavedPlaylistEntry(message.guildId, playlistName);
+    if (!existing) {
+      return message.reply('❌ Playlist não encontrada. Use `+playlist salvar <nome>` primeiro.');
+    }
+    const snapshot = getPlaylistSnapshot(message.guildId);
+    if (!snapshot) {
+      return message.reply('❌ Não há playlist/fila ativa para atualizar agora.');
+    }
+    const updated = upsertSavedPlaylist(message.guildId, playlistName, snapshot);
+    if (!updated.ok) return message.reply('❌ Não consegui atualizar essa playlist.');
+    const total = (snapshot.currentSong ? 1 : 0) + (Array.isArray(snapshot.queue) ? snapshot.queue.length : 0);
+    return message.reply(`♻️ Playlist **${updated.name}** atualizada com **${total}** música(s).`);
+  }
+
+  if (isAction('load')) {
+    if (isPlaylistLoadInProgress(message.guildId)) {
+      return message.reply('⏳ A playlist ainda está carregando. Aguarde finalizar para carregar uma playlist salva.');
+    }
+    const entries = listSavedPlaylistEntries(message.guildId);
+    let resolvedName = playlistName;
+    if (/^\d+$/.test(playlistName)) {
+      const idx = Number(playlistName) - 1;
+      resolvedName = entries[idx]?.storageName || '';
+    }
+
+    const found = getSavedPlaylistEntry(message.guildId, resolvedName);
+    if (!found) {
+      return message.reply('❌ Playlist não encontrada. Use `+playlist listar` para ver as salvas (nome ou número).');
+    }
+
+    const restored = await restorePlaylistSnapshot(message, found.entry.snapshot).catch((err) => ({ ok: false, reason: err?.message || 'restore-error' }));
+    if (!restored?.ok) {
+      return message.reply('❌ Não consegui carregar essa playlist salva.');
+    }
+
+    await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+    const total = Number(restored.totalSongs) || 0;
+    const currentTitle = restored.currentTitle || 'música';
+    setActiveLoadedPlaylist(message.guildId, found.name);
+    return message.reply(`▶️ Playlist **${found.name}** carregada (${total} música(s)). Tocando: **${currentTitle}**.`);
+  }
+
+  if (isAction('delete')) {
+    const entries = listSavedPlaylistEntries(message.guildId);
+    let resolvedName = playlistName;
+    if (/^\d+$/.test(playlistName)) {
+      const idx = Number(playlistName) - 1;
+      resolvedName = entries[idx]?.storageName || '';
+    }
+    if (!resolvedName) {
+      return message.reply('❌ Playlist não encontrada para apagar (nome ou número inválido).');
+    }
+
+    const ok = deleteSavedPlaylist(message.guildId, resolvedName);
+    if (!ok) return message.reply('❌ Playlist não encontrada para apagar.');
+    if (getActiveLoadedPlaylist(message.guildId) === normalizePlaylistName(resolvedName)) {
+      clearActiveLoadedPlaylist(message.guildId);
+    }
+    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+    return message.reply(`🗑️ Playlist **${normalizePlaylistName(resolvedName)}** removida.`);
+  }
+
+  return message.reply('❌ Ação inválida. Use `+playlist listar|salvar|carregar|atualizar|apagar <nome|numero>`.');
+}
+
 function getCurrentSongQueuePage(guildId) {
   const pageSize = Number(BOT_CFG.ui?.queuePageSize) || 8;
   const { currentIndex, loopPlaylist } = getQueueFull(guildId);
@@ -1782,6 +2208,15 @@ const QUEUE_UI_COMPONENT_PREFIXES = [
   'queue_prev_',
   'queue_next_',
   'queue_play_',
+  'queue_remove_pick_',
+  'queue_remove_current_',
+  'queue_save_pick_',
+  'queue_update_current_',
+  'queue_saved_load_pick_',
+  'queue_saved_list_',
+  'queue_saved_delete_pick_',
+  'queue_saved_update_',
+  'queue_saved_delete_',
   'queue_loopplaylist_',
   'queue_restart_',
 ];
@@ -1820,6 +2255,12 @@ const NOW_PLAYING_MESSAGE_PREFIXES = ['🎶 Tocando:', '🔊 Tocando:'];
 const TRANSIENT_BOT_MESSAGE_PREFIXES = [
   '❌ Não encontrei resultados para essa busca no YouTube.',
   '📋 A fila está vazia.',
+  '📋 Spotify:',
+  '✅ Spotify:',
+  '📋 SoundCloud:',
+  '✅ SoundCloud:',
+  '📋 Lendo playlist do SoundCloud...',
+  '📋 Playlist com ',
 ];
 const STALE_UI_COMPONENT_PREFIXES = [
   'effects_dismiss_',
@@ -1828,8 +2269,18 @@ const STALE_UI_COMPONENT_PREFIXES = [
   'queue_prev_',
   'queue_next_',
   'queue_play_',
+  'queue_remove_pick_',
+  'queue_remove_current_',
+  'queue_save_pick_',
+  'queue_update_current_',
+  'queue_saved_load_pick_',
+  'queue_saved_list_',
+  'queue_saved_delete_pick_',
+  'queue_saved_update_',
+  'queue_saved_delete_',
   'queue_loopplaylist_',
   'queue_restart_',
+  'music_remove_current_',
 ];
 
 function isNowPlayingLikeBotMessage(msg) {
@@ -2059,18 +2510,22 @@ function buildHelpEmbed() {
     .setColor(0x5865f2)
     .setTitle('🎵 BotDucz — +help')
     .setDescription(
-      'Central de ajuda do BotDucz: use **+p**, **+play** ou **+tocar** para músicas e **+i** para instants. Comandos em PT-BR e EN disponíveis.'
+      'Central de ajuda do BotDucz: use **+p**, **+play** ou **+tocar** para músicas e **+i** para sons instantâneos. Comandos em PT-BR e EN disponíveis.'
     )
     .addFields(
       {
         name: '🚀 Comandos principais (PT-BR / EN)',
         value:
-          '```\n+p <texto|link>\n+play <texto|link>\n+tocar <texto|link>\n+i <texto|link-myinstants>\n+stop\n+skip\n```\n' +
+          '**PT-BR**\n' +
+          '`+p <texto|link>` • `+tocar <texto|link>` • `+i <texto|link-myinstants>`\n' +
+          '`+stop` • `+skip`\n\n' +
+          '**EN**\n' +
+          '`+play <text|link>` • `+i <text|myinstants-link>`\n\n' +
           'Exemplos: `+p legiao urbana`, `+play queen bohemian rhapsody`, `+i risada`\n' +
-          'Alias legado ainda aceito: `+d` / `+Ducz`.',
+          'Alias legado aceito: `+d` / `+Ducz`.',
       },
       {
-        name: '▶️ Instant do MyInstants (link)',
+        name: '▶️ Instant do MyInstants (PT-BR / EN)',
         value:
           '```\n+i <link-do-myinstants>\n```\nExemplo: `+i https://www.myinstants.com/pt/instant/briga-de-gato-25101/`',
       },
@@ -2078,7 +2533,7 @@ function buildHelpEmbed() {
         name: '🔍 Buscar instant (PT-BR / EN)',
         value:
           '```\n+i <descricao do som>\n```\nExemplo: `+i briga de gato`\n' +
-          '💡 *Instants tocam instantaneamente, mesmo com qualquer audio tocando!*\n' +
+          '💡 *Instants tocam instantaneamente, mesmo com qualquer áudio tocando!*\n' +
           '🦆 Reaja com **🦆** para repetir • 📢 **📢** para tocar mais alto (uma vez) • ⭐ **⭐** para favoritar',
       },
       {
@@ -2092,7 +2547,7 @@ function buildHelpEmbed() {
           '```\n+p <nome da música>\n+play <music name>\n+tocar <nome da música>\n```\nExemplo: `+p nirvana smells like teen spirit`',
       },
       {
-        name: '📋 Playlist do YouTube',
+        name: '📋 Playlist do YouTube (PT-BR / EN)',
         value:
           '```\n+p <link-da-playlist>\n```\nColoque um link com `&list=` e todas as músicas serão adicionadas à fila!',
       },
@@ -2101,32 +2556,51 @@ function buildHelpEmbed() {
         value: '```\n+skip\n+pular\n```',
       },
       {
-        name: '📋 Ver fila de músicas',
-        value: '```\n+fila\n+queue\n```',
+        name: '📋 Ver fila de músicas (PT-BR / EN)',
+        value:
+          '**Visualizar / navegar**\n' +
+          '`+fila` • `+queue` • `+fila <n>`\n\n' +
+          '**Remover por posição**\n' +
+          '`+fila remove <n>` • `+queue remove <n>` • `+remove <n>` • `+rm <n>`\n\n' +
+          '**Remover atual**\n' +
+          '`+fila remove atual` • `+remove atual` • `+rm atual`',
+      },
+      {
+        name: '💾 Playlists salvas (PT-BR / EN)',
+        value:
+          '**PT-BR**\n' +
+          '`+fila listar` • `+fila salvar <nome>` • `+fila carregar <nome|numero>`\n' +
+          '`+fila atualizar <nome>` • `+fila apagar <nome|numero>`\n\n' +
+          '**EN**\n' +
+          '`+fila list` • `+fila save <name>` • `+fila load <name|number>`\n' +
+          '`+fila update <name>` • `+fila delete <name|number>`\n\n' +
+          '**Atalhos**\n' +
+          '`+playlist ...` • `+pl ...`\n\n' +
+          '**Painel +fila**\n' +
+          '`Tocar (#)` • `Remover (#)` • `Reiniciar` • `Loop Playlist`\n' +
+          '`Atualizar Playlist` • `Apagar Playlist` • `Carregar salva (#/nome)`\n' +
+          '`Playlists salvas` • `Apagar salva (#/nome)` • `Descartar`',
       },
       {
         name: '⏹️ Parar e limpar fila (PT-BR / EN)',
         value: '```\n+stop\n+parar\n```',
       },
       {
-        name: '🎛️ Efeitos de áudio',
+        name: '🎛️ Efeitos de áudio (PT-BR / EN)',
         value:
           '```\n+efeito <nome> [1-10]\n+ef <nome> [1-10]\n+ef\n+ef <1-10>\n+ef status\n+ef off\n+ef lista\n+efeitos\n```\nEx: `+efeito robot 8`, `+ef robot 8`, `+ef`',
       },
       {
         name: '🧠 Funcionalidades',
         value:
-          '• Pesquisa YouTube e MyInstants\n' +
-          '• Suporte a playlist do YouTube, SoundCloud e Spotify\n' +
-          '• Fila com paginação e botão "Tocar (#)"\n' +
-          '• Jump para posição da fila (`+fila <n>`)\n' +
-          '• Efeitos com intensidade por nível\n' +
-            '• Repetição rápida de SFX via reação 🦆\n' +
-            '• 📢 Megafone: toca o instant mais alto (uma vez por mensagem)\n' +
-              '• 📢 Megafones antigos são limpos ao iniciar/encerrar o bot\n' +
-            '• Favoritar busca do +i via ⭐ e executar com `+fav`\n' +
-              '• Status de favorito do +i reutiliza uma única mensagem por instant\n' +
-          '• Mensagens de fila/status removidas automaticamente ao terminar',
+          '• YouTube, SoundCloud, Spotify e MyInstants\n' +
+          '• Fila paginada com botões e jump por número\n' +
+          '• Remoção por posição e remoção da música atual\n' +
+          '• Playlists salvas (salvar, carregar, atualizar, apagar) por nome ou número\n' +
+          '• Efeitos de áudio com intensidade por nível\n' +
+          '• Reações no +i: 🦆 repetir, 📢 megafone, ⭐ favoritar\n' +
+          '• Favoritos compartilhados (`+fav`)\n' +
+          '• Limpeza automática de mensagens transitórias de fila/status',
       },
       {
         name: '⚙️ Administração',
@@ -2134,9 +2608,17 @@ function buildHelpEmbed() {
           '```\n+prefix\n+prefix <novo_prefixo>\n+prefix set <novo_prefixo>\n+prefix reset\n+killbot\n```\n`+killbot` é restrito ao dono do bot.',
       },
       {
-        name: '🧩 Slash Commands (/)',
+        name: '🧩 Comandos Slash (/)',
         value:
-          '```\n/play query:<texto|link>\n/instants query:<texto|link myinstants>\n/queue [posicao]\n/skip\n/stop\n/effect acao:<ativar|off|status|lista> [nome] [intensidade]\n/prefix acao:<view|set|reset> [valor]\n/leave\n/help\n/killbot\n```',
+          '`/play query:<texto|link>`\n' +
+          '`/instants query:<texto|link myinstants>`\n' +
+          '`/queue [posicao]`\n' +
+          '`/remove alvo:<atual|posicao> [posicao]`\n' +
+          '`/playlist acao:<listar|salvar|carregar|atualizar|apagar> [referencia]`\n' +
+          '`/skip` • `/stop` • `/leave`\n' +
+          '`/effect acao:<ativar|off|status|lista> [nome] [intensidade]`\n' +
+          '`/prefix acao:<view|set|reset> [valor]`\n' +
+          '`/help` • `/killbot`',
       },
       {
         name: '🚪 Sair do canal de voz',
@@ -2267,6 +2749,7 @@ async function handleInstantsQuery(message, query) {
 
 async function handlePlayQuery(message, query) {
   const input = query.split(/\s+/)[0];
+  let playlistLoadToken = null;
   beginPendingPlayRequest(message.guildId);
   clearSpotifyLoadSession(message.guildId);
   clearQueueStatusMessages(message.guildId);
@@ -2292,6 +2775,7 @@ async function handlePlayQuery(message, query) {
     if (SOUNDCLOUD_REGEX.test(input)) {
       if (SOUNDCLOUD_SET_REGEX.test(input)) {
         const scLoadToken = startSpotifyLoadSession(message.guildId);
+        playlistLoadToken = scLoadToken;
         soundCloudProgressAnchorMessageIds.set(message.guildId, message.id);
         setNowPlayingAnchorEnabled(message.guildId, false);
         const previousProgressEntry = activeSoundCloudProgressMessages.get(message.guildId);
@@ -2379,7 +2863,7 @@ async function handlePlayQuery(message, query) {
           const finalMsg = await upsertSoundCloudProgressMessage(message, successText).catch(() => null);
 
           setNowPlayingAnchorEnabled(message.guildId, true);
-          await refreshNowPlayingMessage(message.guildId, { forceResend: true }).catch(() => {});
+          await refreshNowPlayingMessage(message.guildId).catch(() => {});
 
           if (finalMsg?.id) {
             activeSoundCloudProgressMessages.set(message.guildId, {
@@ -2429,6 +2913,7 @@ async function handlePlayQuery(message, query) {
     // Link de playlist/album do Spotify: extrai faixas e resolve para YouTube
     if (SPOTIFY_COLLECTION_REGEX.test(input)) {
       const loadToken = startSpotifyLoadSession(message.guildId);
+      playlistLoadToken = loadToken;
       let progressMsg = await message.reply('📋 Lendo playlist/álbum do Spotify...').catch(() => null);
       console.log('📋 Spotify coleção detectada. Iniciando extração de faixas...');
 
@@ -2590,8 +3075,12 @@ async function handlePlayQuery(message, query) {
     console.error('❌ Erro:', error.message);
     return message.reply(`❌ Erro: ${error.message}`);
   } finally {
+    if (playlistLoadToken) {
+      clearSpotifyLoadSession(message.guildId, playlistLoadToken);
+    }
     finishPendingPlayRequest(message.guildId);
     await flushDeferredSkipIfReady(message.guildId).catch(() => {});
+    await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
   }
 }
 
@@ -2781,6 +3270,54 @@ const slashCommands = [
     ],
   },
   {
+    name: 'remove',
+    description: 'Remove música atual ou remove por posição da fila',
+    options: [
+      {
+        name: 'alvo',
+        type: 3,
+        description: 'O que remover',
+        required: true,
+        choices: [
+          { name: 'atual', value: 'atual' },
+          { name: 'posicao', value: 'posicao' },
+        ],
+      },
+      {
+        name: 'posicao',
+        type: 4,
+        description: 'Posição da fila (obrigatório quando alvo=posicao)',
+        required: false,
+        min_value: 1,
+      },
+    ],
+  },
+  {
+    name: 'playlist',
+    description: 'Gerencia playlists salvas (nome ou número da listagem)',
+    options: [
+      {
+        name: 'acao',
+        type: 3,
+        description: 'Ação da playlist',
+        required: true,
+        choices: [
+          { name: 'listar', value: 'listar' },
+          { name: 'salvar', value: 'salvar' },
+          { name: 'carregar', value: 'carregar' },
+          { name: 'atualizar', value: 'atualizar' },
+          { name: 'apagar', value: 'apagar' },
+        ],
+      },
+      {
+        name: 'referencia',
+        type: 3,
+        description: 'Nome da playlist ou número da listagem',
+        required: false,
+      },
+    ],
+  },
+  {
     name: 'effect',
     description: 'Controla efeitos de áudio',
     options: [
@@ -2920,7 +3457,7 @@ client.on('messageCreate', async (message) => {
     if (message.content.toLowerCase().startsWith(p.toLowerCase())) {
       const nextChar = message.content[p.length];
       const lower = p.toLowerCase();
-      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
+      const requiresSpace = ['+p', '+play', '+tocar', '+d', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+remove', '+rm', '+playlist', '+pl', '+clear', '+parar', '+pular', '+sair', '+leave', '+ajuda', '+prefix'].includes(lower);
       if (requiresSpace && nextChar && !/\s/.test(nextChar)) continue;
       usedPrefix = p;
       break;
@@ -2940,6 +3477,7 @@ client.on('messageCreate', async (message) => {
   if (normalizedPrefix === '+stop') {
     clearSpotifyLoadSession(message.guildId);
     clearDeferredSkip(message.guildId);
+    clearActiveLoadedPlaylist(message.guildId);
     const result = await stop(message);
     updateBotPresence(null);
     await clearQueueMessagesForGuild(message.guildId).catch(() => {});
@@ -2949,6 +3487,7 @@ client.on('messageCreate', async (message) => {
   if (normalizedPrefix === '+parar') {
     clearSpotifyLoadSession(message.guildId);
     clearDeferredSkip(message.guildId);
+    clearActiveLoadedPlaylist(message.guildId);
     const result = await stop(message);
     updateBotPresence(null);
     await clearQueueMessagesForGuild(message.guildId).catch(() => {});
@@ -2960,9 +3499,30 @@ client.on('messageCreate', async (message) => {
     await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
     return result;
   }
+  if (normalizedPrefix === '+remove' || normalizedPrefix === '+rm') {
+    const raw = message.content.slice(usedPrefix.length).trim();
+    const normalizedRaw = raw.toLowerCase();
+    if (normalizedRaw === 'atual' || normalizedRaw === 'current' || normalizedRaw === 'now') {
+      const result = await removeCurrentSongByCommand(message);
+      await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      return result;
+    }
+    const target = Number(raw);
+    if (Number.isNaN(target) || target < 1) {
+      return message.reply('❌ Uso: `+remove <número>` / `+rm <número>` ou `+remove atual` / `+rm atual`.');
+    }
+    const result = await removeQueuePositionByCommand(message, target);
+    await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+    return result;
+  }
+  if (normalizedPrefix === '+playlist' || normalizedPrefix === '+pl') {
+    const raw = message.content.slice(usedPrefix.length).trim();
+    return handlePlaylistCommand(message, raw);
+  }
   if (normalizedPrefix === '+sair' || normalizedPrefix === '+leave') {
     clearSpotifyLoadSession(message.guildId);
     clearDeferredSkip(message.guildId);
+    clearActiveLoadedPlaylist(message.guildId);
     const result = leave(message);
     updateBotPresence(null);
     await clearQueueMessagesForGuild(message.guildId).catch(() => {});
@@ -3056,6 +3616,36 @@ client.on('messageCreate', async (message) => {
 
   if (normalizedPrefix === '+fila' || normalizedPrefix === '+queue') {
     const remaining = message.content.slice(usedPrefix.length).trim();
+    const playlistMatch = remaining.match(/^(listar|list|ls|salvar|save|carregar|load|atualizar|update|apagar|delete|del)(?:\s+(.+))?$/i);
+    if (playlistMatch) {
+      const action = String(playlistMatch[1] || '').trim().toLowerCase();
+      const name = String(playlistMatch[2] || '').trim();
+      const mapped = ['listar', 'list', 'ls'].includes(action)
+        ? 'listar'
+        : ['salvar', 'save'].includes(action)
+          ? 'salvar'
+          : ['carregar', 'load'].includes(action)
+            ? 'carregar'
+            : ['atualizar', 'update'].includes(action)
+              ? 'atualizar'
+              : 'apagar';
+      const forwarded = name ? `${mapped} ${name}` : mapped;
+      return handlePlaylistCommand(message, forwarded);
+    }
+
+    const removeCurrentMatch = remaining.match(/^(remove|rm|del|remover)\s+(atual|current|now)$/i);
+    if (removeCurrentMatch) {
+      const result = await removeCurrentSongByCommand(message);
+      await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      return result;
+    }
+    const removeMatch = remaining.match(/^(remove|rm|del|remover)\s+(\d+)$/i);
+    if (removeMatch) {
+      const target = Number(removeMatch[2]);
+      const result = await removeQueuePositionByCommand(message, target);
+      await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      return result;
+    }
     const target = Number(remaining);
     if (remaining && !Number.isNaN(target) && target >= 1) {
       const result = await jumpToQueue(message, target);
@@ -3200,8 +3790,8 @@ client.on('messageCreate', async (message) => {
 
   if (cmd === 'ajuda') return sendDismissableHelpMessage(message);
   if (cmd === 'help') return sendDismissableHelpMessage(message);
-  if (normalizedPrefix === '+p' && ['skip', 'pular', 'stop', 'parar', 'sair', 'leave', 'help', 'ajuda', 'queue', 'fila', 'prefix', 'instant', 'instants'].includes(cmd)) {
-    return message.reply('ℹ️ O `+p` agora é exclusivo para tocar música. Use `+skip`, `+stop`, `+fila`, `+help`, `+sair`, `+prefix` e `+i` para os demais comandos.');
+  if (normalizedPrefix === '+p' && ['skip', 'pular', 'stop', 'parar', 'sair', 'leave', 'help', 'ajuda', 'queue', 'fila', 'remove', 'rm', 'playlist', 'pl', 'prefix', 'instant', 'instants'].includes(cmd)) {
+    return message.reply('ℹ️ O `+p` agora é exclusivo para tocar música. Use `+skip`, `+stop`, `+fila`, `+remove`, `+playlist`, `+help`, `+sair`, `+prefix` e `+i` para os demais comandos.');
   }
   if (cmd === 'play' || cmd === 'tocar') {
     if (normalizedPrefix === '+p') {
@@ -3227,6 +3817,7 @@ client.on('messageCreate', async (message) => {
     }
     clearSpotifyLoadSession(message.guildId);
     clearDeferredSkip(message.guildId);
+    clearActiveLoadedPlaylist(message.guildId);
     const result = await stop(message, (text) => sendEphemeralMessage(message, text));
     updateBotPresence(null);
     await clearQueueMessagesForGuild(message.guildId).catch(() => {});
@@ -3239,6 +3830,7 @@ client.on('messageCreate', async (message) => {
     }
     clearSpotifyLoadSession(message.guildId);
     clearDeferredSkip(message.guildId);
+    clearActiveLoadedPlaylist(message.guildId);
     const result = leave(message);
     updateBotPresence(null);
     await clearQueueMessagesForGuild(message.guildId).catch(() => {});
@@ -3305,7 +3897,56 @@ client.on('messageCreate', async (message) => {
   }
 
   if (cmd === 'fila' || cmd === 'queue') {
+    const sub = (argsParts[1] || '').toLowerCase();
+
+    if (['listar', 'list', 'ls'].includes(sub)) {
+      return handlePlaylistCommand(message, 'listar');
+    }
+
+    if (['salvar', 'save', 'carregar', 'load', 'atualizar', 'update', 'apagar', 'delete', 'del'].includes(sub)) {
+      const name = argsParts.slice(2).join(' ').trim();
+      if (!name && !['listar', 'list', 'ls'].includes(sub)) {
+        return message.reply('❌ Informe o nome. Ex: `+fila salvar academia`');
+      }
+      const mapped = ['salvar', 'save'].includes(sub)
+        ? 'salvar'
+        : ['carregar', 'load'].includes(sub)
+          ? 'carregar'
+          : ['atualizar', 'update'].includes(sub)
+            ? 'atualizar'
+            : 'apagar';
+      return handlePlaylistCommand(message, `${mapped} ${name}`.trim());
+    }
+
+    if (['remove', 'rm', 'del', 'remover'].includes(sub)) {
+      const maybeCurrent = (argsParts[2] || '').toLowerCase();
+      if (['atual', 'current', 'now'].includes(maybeCurrent)) {
+        const result = await removeCurrentSongByCommand(message);
+        await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+        return result;
+      }
+      const target = Number(argsParts[2]);
+      if (Number.isNaN(target) || target < 1) {
+        return message.reply('❌ Uso: `+fila remove <número>` / `+queue remove <número>` ou `+fila remove atual`.');
+      }
+      const result = await removeQueuePositionByCommand(message, target);
+      await refreshQueueMessagesForGuild(message.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      return result;
+    }
+
+    if (/^\d+$/.test(argsParts[1] || '')) {
+      const target = Number(argsParts[1]);
+      const result = await jumpToQueue(message, target);
+      await refreshQueueMessagesForGuild(message.guildId).catch(() => {});
+      return result;
+    }
+
     return showQueueMessage(message);
+  }
+
+  if (cmd === 'playlist' || cmd === 'pl') {
+    const subRaw = argsParts.slice(1).join(' ').trim();
+    return handlePlaylistCommand(message, subRaw);
   }
 
   // ---- Detectar tipo de input ----
@@ -3370,6 +4011,7 @@ client.on('interactionCreate', async (interaction) => {
     if (cmd === 'stop') {
       clearSpotifyLoadSession(msg.guildId);
       clearDeferredSkip(msg.guildId);
+      clearActiveLoadedPlaylist(msg.guildId);
       const result = await stop(msg, (text) => msg.reply({ content: text, ephemeral: true }));
       updateBotPresence(null);
       await clearQueueMessagesForGuild(msg.guildId).catch(() => {});
@@ -3383,6 +4025,43 @@ client.on('interactionCreate', async (interaction) => {
         return jumpToQueue(msg, targetPos);
       }
       return showQueueMessage(msg);
+    }
+
+    if (cmd === 'remove') {
+      if (isPlaylistLoadInProgress(msg.guildId)) {
+        return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para remover.', ephemeral: true });
+      }
+
+      const alvo = interaction.options.getString('alvo');
+      if (alvo === 'atual') {
+        const result = await removeCurrentSongByCommand(msg);
+        await refreshQueueMessagesForGuild(msg.guildId, { forceCurrentSongPage: true }).catch(() => {});
+        return result;
+      }
+
+      const posicao = interaction.options.getInteger('posicao');
+      if (!Number.isFinite(posicao) || posicao < 1) {
+        return interaction.reply({ content: '❌ Informe `posicao` quando `alvo=posicao`.', ephemeral: true });
+      }
+
+      const result = await removeQueuePositionByCommand(msg, posicao);
+      await refreshQueueMessagesForGuild(msg.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      return result;
+    }
+
+    if (cmd === 'playlist') {
+      const action = String(interaction.options.getString('acao') || '').toLowerCase();
+      const ref = String(interaction.options.getString('referencia') || '').trim();
+
+      if (action === 'listar') {
+        return handlePlaylistCommand(msg, 'listar');
+      }
+
+      if (!ref) {
+        return interaction.reply({ content: '❌ Informe `referencia` (nome ou número) para essa ação.', ephemeral: true });
+      }
+
+      return handlePlaylistCommand(msg, `${action} ${ref}`.trim());
     }
 
     if (cmd === 'effect') {
@@ -3434,12 +4113,12 @@ client.on('interactionCreate', async (interaction) => {
         return msg.reply(`ℹ️ O efeito **${effect}** já está ativo (intensidade ${currentIntensity}/10).`);
       }
 
-      setEffect(message.guildId, effect);
-      const appliedNow = applyEffectNow(message.guildId);
+      setEffect(msg.guildId, effect);
+      const appliedNow = applyEffectNow(msg.guildId);
       const supportsIntensity = effectSupportsIntensity(effect);
-      const effectiveIntensity = getEffectIntensity(message.guildId);
-      clearEffectErrorMessage(message.guildId);
-      return sendTimedEffectConfirm(message, message.guildId,
+      const effectiveIntensity = getEffectIntensity(msg.guildId);
+      clearEffectErrorMessage(msg.guildId);
+      return sendTimedEffectConfirm(msg, msg.guildId,
         appliedNow
           ? supportsIntensity
             ? `✅ Efeito **${effect}** (intensidade ${effectiveIntensity}/10) ativado e aplicado imediatamente.`
@@ -3481,6 +4160,7 @@ client.on('interactionCreate', async (interaction) => {
     if (cmd === 'leave') {
       clearSpotifyLoadSession(msg.guildId);
       clearDeferredSkip(msg.guildId);
+      clearActiveLoadedPlaylist(msg.guildId);
       const result = leave(msg);
       updateBotPresence(null);
       await clearQueueMessagesForGuild(msg.guildId).catch(() => {});
@@ -3506,46 +4186,180 @@ client.on('interactionCreate', async (interaction) => {
   // ============================================================
   // Modal submit (tocar por número)
   if (interaction.isModalSubmit()) {
-    if (interaction.customId !== 'queue_play_modal') return;
+    if (interaction.customId === 'queue_play_modal') {
+      if (isPlaylistLoadInProgress(interaction.guildId)) {
+        return interaction.reply({
+          content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).',
+          ephemeral: true,
+        });
+      }
 
-    if (isPlaylistLoadInProgress(interaction.guildId)) {
-      return interaction.reply({
-        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).',
-        ephemeral: true,
-      });
+      const positionValue = interaction.fields.getTextInputValue('queuePosition');
+      const position = Number(positionValue);
+      if (Number.isNaN(position) || position < 1) {
+        return interaction.reply({ content: '❌ Número inválido. Use um número válido da fila.', ephemeral: true });
+      }
+
+      const { queue } = getQueue(interaction.guildId);
+      const { loopPlaylist, playlistSongs } = getQueueFull(interaction.guildId);
+      const totalSongs = loopPlaylist ? playlistSongs.length : queue.length;
+      if (!totalSongs) {
+        return interaction.reply({ content: '❌ A fila está vazia.', ephemeral: true });
+      }
+      if (position > totalSongs) {
+        return interaction.reply({
+          content: `❌ A fila tem apenas **${totalSongs}** música(s). Não existe a posição **${position}**.`,
+          ephemeral: true,
+        });
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const success = await jumpTo(interaction.guildId, position);
+      if (!success) {
+        return interaction.editReply('❌ Não consegui ir para essa música. Tente abrir `+fila` novamente.');
+      }
+
+      await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      await interaction.editReply(`▶️ Indo para a música #${position} da fila...`);
+      setTimeout(() => {
+        interaction.deleteReply().catch(() => {});
+      }, 10_000);
+      return;
     }
 
-    const positionValue = interaction.fields.getTextInputValue('queuePosition');
-    const position = Number(positionValue);
-    if (Number.isNaN(position) || position < 1) {
-      return interaction.reply({ content: '❌ Número inválido. Use um número válido da fila.', ephemeral: true });
+    if (interaction.customId === 'queue_remove_modal') {
+      if (isPlaylistLoadInProgress(interaction.guildId)) {
+        return interaction.reply({
+          content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Remover (#).',
+          ephemeral: true,
+        });
+      }
+
+      const positionValue = interaction.fields.getTextInputValue('queueRemovePosition');
+      const position = Number(positionValue);
+      if (Number.isNaN(position) || position < 1) {
+        return interaction.reply({ content: '❌ Número inválido. Use um número válido da fila.', ephemeral: true });
+      }
+
+      const result = await removeQueuePosition(interaction.guildId, position);
+      if (!result?.ok) {
+        return interaction.reply({ content: '❌ Não consegui remover essa música. Confira a posição em `+fila`.', ephemeral: true });
+      }
+
+      await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
+      if (result.removedCurrent) {
+        await refreshNowPlayingMessage(interaction.guildId, { forceResend: true }).catch(() => {});
+      }
+
+      const removedTitle = result.removedSong?.title || 'música';
+      return interaction.reply({ content: `🗑️ Removida a música #${position}: **${removedTitle}**.`, ephemeral: true });
     }
 
-    const { queue } = getQueue(interaction.guildId);
-    const { loopPlaylist, playlistSongs } = getQueueFull(interaction.guildId);
-    const totalSongs = loopPlaylist ? playlistSongs.length : queue.length;
-    if (!totalSongs) {
-      return interaction.reply({ content: '❌ A fila está vazia.', ephemeral: true });
-    }
-    if (position > totalSongs) {
-      return interaction.reply({
-        content: `❌ A fila tem apenas **${totalSongs}** música(s). Não existe a posição **${position}**.`,
-        ephemeral: true,
-      });
+    if (interaction.customId === 'queue_saved_delete_modal') {
+      const value = String(interaction.fields.getTextInputValue('savedPlaylistRef') || '').trim();
+      if (!value) {
+        return interaction.reply({ content: '❌ Informe o nome ou número da playlist salva.', ephemeral: true });
+      }
+
+      const entries = listSavedPlaylistEntries(interaction.guildId);
+      let resolvedName = value;
+      if (/^\d+$/.test(value)) {
+        const idx = Number(value) - 1;
+        resolvedName = entries[idx]?.storageName || '';
+      }
+      if (!resolvedName) {
+        return interaction.reply({ content: '❌ Playlist não encontrada para apagar (nome ou número inválido).', ephemeral: true });
+      }
+
+      const ok = deleteSavedPlaylist(interaction.guildId, resolvedName);
+      if (!ok) {
+        return interaction.reply({ content: '❌ Playlist não encontrada para apagar.', ephemeral: true });
+      }
+
+      if (getActiveLoadedPlaylist(interaction.guildId) === normalizePlaylistName(resolvedName)) {
+        clearActiveLoadedPlaylist(interaction.guildId);
+      }
+      await refreshQueueMessagesForGuild(interaction.guildId).catch(() => {});
+      return interaction.reply({ content: `🗑️ Playlist **${normalizePlaylistName(resolvedName)}** removida.`, ephemeral: true });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    if (interaction.customId === 'queue_saved_load_modal') {
+      if (isPlaylistLoadInProgress(interaction.guildId)) {
+        return interaction.reply({
+          content: '⏳ A playlist ainda está carregando. Aguarde finalizar para carregar outra playlist salva.',
+          ephemeral: true,
+        });
+      }
 
-    const success = await jumpTo(interaction.guildId, position);
-    if (!success) {
-      return interaction.editReply('❌ Não consegui ir para essa música. Tente abrir `+fila` novamente.');
+      const value = String(interaction.fields.getTextInputValue('savedPlaylistLoadRef') || '').trim();
+      if (!value) {
+        return interaction.reply({ content: '❌ Informe o nome ou número da playlist salva.', ephemeral: true });
+      }
+
+      const entries = listSavedPlaylistEntries(interaction.guildId);
+      let resolvedName = value;
+      if (/^\d+$/.test(value)) {
+        const idx = Number(value) - 1;
+        resolvedName = entries[idx]?.storageName || '';
+      }
+      if (!resolvedName) {
+        return interaction.reply({ content: '❌ Playlist não encontrada para carregar (nome ou número inválido).', ephemeral: true });
+      }
+
+      const found = getSavedPlaylistEntry(interaction.guildId, resolvedName);
+      if (!found) {
+        return interaction.reply({ content: '❌ Playlist não encontrada para carregar.', ephemeral: true });
+      }
+
+      const msgAdapter = createInteractionMessageAdapter(interaction);
+      const restored = await restorePlaylistSnapshot(msgAdapter, found.entry.snapshot).catch((err) => ({ ok: false, reason: err?.message || 'restore-error' }));
+      if (!restored?.ok) {
+        return interaction.reply({ content: '❌ Não consegui carregar essa playlist salva.', ephemeral: true });
+      }
+
+      setActiveLoadedPlaylist(interaction.guildId, found.name);
+      await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
+
+      const total = Number(restored.totalSongs) || 0;
+      const currentTitle = restored.currentTitle || 'música';
+      return interaction.reply({ content: `▶️ Playlist **${found.name}** carregada (${total} música(s)). Tocando: **${currentTitle}**.`, ephemeral: true });
     }
 
-    await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
-    await interaction.editReply(`▶️ Indo para a música #${position} da fila...`);
-    setTimeout(() => {
-      interaction.deleteReply().catch(() => {});
-    }, 10_000);
+    if (interaction.customId === 'queue_save_modal') {
+      if (isPlaylistLoadInProgress(interaction.guildId)) {
+        return interaction.reply({
+          content: '⏳ A playlist ainda está carregando. Aguarde finalizar para salvar.',
+          ephemeral: true,
+        });
+      }
+
+      const playlistName = String(interaction.fields.getTextInputValue('playlistName') || '').trim();
+      if (!playlistName) {
+        return interaction.reply({ content: '❌ Informe um nome para a playlist.', ephemeral: true });
+      }
+
+      const existing = getSavedPlaylistEntry(interaction.guildId, playlistName);
+      if (existing) {
+        return interaction.reply({ content: '⚠️ Já existe playlist com esse nome. Use `+playlist atualizar <nome>` para sobrescrever.', ephemeral: true });
+      }
+
+      const snapshot = getPlaylistSnapshot(interaction.guildId);
+      if (!snapshot) {
+        return interaction.reply({ content: '❌ Não há playlist/fila ativa para salvar agora.', ephemeral: true });
+      }
+
+      const saved = upsertSavedPlaylist(interaction.guildId, playlistName, snapshot);
+      if (!saved.ok) {
+        return interaction.reply({ content: '❌ Não consegui salvar essa playlist.', ephemeral: true });
+      }
+
+      setActiveLoadedPlaylist(interaction.guildId, playlistName);
+      const total = (snapshot.currentSong ? 1 : 0) + (Array.isArray(snapshot.queue) ? snapshot.queue.length : 0);
+      await refreshQueueMessagesForGuild(interaction.guildId).catch(() => {});
+      return interaction.reply({ content: `✅ Playlist **${saved.name}** salva com **${total}** música(s).`, ephemeral: true });
+    }
+
     return;
   }
 
@@ -3575,8 +4389,10 @@ client.on('interactionCreate', async (interaction) => {
     if (!success) {
       return interaction.reply({ content: '❌ Não há música anterior.', ephemeral: true });
     }
+    await interaction.deferUpdate();
+    await refreshNowPlayingMessage(msgAdapter.guildId, { forceResend: true }).catch(() => {});
     await refreshQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
-    return interaction.deferUpdate();
+    return;
   }
 
   if (interaction.customId.startsWith('music_stop_')) {
@@ -3584,6 +4400,7 @@ client.on('interactionCreate', async (interaction) => {
     const msgAdapter = createInteractionMessageAdapter(interaction);
     clearSpotifyLoadSession(msgAdapter.guildId);
     clearDeferredSkip(msgAdapter.guildId);
+    clearActiveLoadedPlaylist(msgAdapter.guildId);
     await stop(msgAdapter, () => Promise.resolve());
     await clearQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
     await refreshQueueMessagesForGuild(msgAdapter.guildId).catch(() => {});
@@ -3600,6 +4417,7 @@ client.on('interactionCreate', async (interaction) => {
     );
     if (!result?.deferred) {
       await interaction.deferUpdate();
+      await refreshNowPlayingMessage(msgAdapter.guildId, { forceResend: true }).catch(() => {});
     }
     await refreshQueueMessagesForGuild(msgAdapter.guildId, { forceCurrentSongPage: true }).catch(() => {});
     return;
@@ -3609,7 +4427,21 @@ client.on('interactionCreate', async (interaction) => {
     const guildId = interaction.customId.slice('music_loop_'.length);
     toggleLoop(guildId);
     const row = buildMusicControlRow(guildId);
-    return interaction.update({ components: [row] });
+    await interaction.update({ components: [row] });
+    await refreshNowPlayingMessage(guildId).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('music_remove_current_')) {
+    const guildId = interaction.customId.slice('music_remove_current_'.length);
+    const result = await removeCurrentSong(guildId);
+    if (!result?.ok) {
+      return interaction.reply({ content: '❌ Não há música atual para remover.', ephemeral: true });
+    }
+    await interaction.deferUpdate().catch(() => {});
+    await refreshQueueMessagesForGuild(guildId, { forceCurrentSongPage: true }).catch(() => {});
+    await refreshNowPlayingMessage(guildId, { forceResend: true }).catch(() => {});
+    return;
   }
 
   if (interaction.customId.startsWith('myinstants_')) {
@@ -3652,10 +4484,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.customId.startsWith('queue_dismiss_')) {
     const entry = pendingQueueMessages.get(interaction.message.id);
-    if (!entry) return interaction.deferUpdate();
-
     pendingQueueMessages.delete(interaction.message.id);
-    if (entry.timeoutId) clearTimeout(entry.timeoutId);
+    if (entry?.timeoutId) clearTimeout(entry.timeoutId);
+
+    await interaction.deferUpdate().catch(() => {});
 
     return interaction.message.delete().catch(() => {});
   }
@@ -3690,7 +4522,7 @@ client.on('interactionCreate', async (interaction) => {
 
     const parts = interaction.customId.split('_');
     const nextPage = Number(parts[3]);
-    const entry = pendingQueueMessages.get(interaction.message.id);
+    const entry = ensureQueueInteractionState(interaction, nextPage);
     if (!entry) return interaction.deferUpdate();
 
     // Responde imediatamente ao Discord
@@ -3700,8 +4532,179 @@ client.on('interactionCreate', async (interaction) => {
     await showQueueMessage(interaction.message, nextPage, interaction.message);
   }
 
+  if (interaction.customId.startsWith('queue_remove_current_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para remover a música atual.',
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+    const result = await removeCurrentSong(interaction.guildId);
+    if (!result?.ok) {
+      await interaction.followUp({
+        content: '❌ Não há música atual para remover.',
+        ephemeral: true,
+      }).catch(() => {});
+      return;
+    }
+
+    await refreshQueueMessagesForGuild(interaction.guildId, { forceCurrentSongPage: true }).catch(() => {});
+    await showQueueMessage(interaction.message, entry.page || 0, interaction.message).catch(() => {});
+    await refreshNowPlayingMessage(interaction.guildId, { forceResend: true }).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_saved_update_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para atualizar a playlist salva.',
+        ephemeral: true,
+      });
+    }
+
+    const activeName = getActiveLoadedPlaylist(interaction.guildId);
+    if (!activeName) {
+      return interaction.reply({ content: '❌ Nenhuma playlist carregada para atualizar.', ephemeral: true });
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+    const msgAdapter = createInteractionMessageAdapter(interaction);
+    await handlePlaylistCommand(msgAdapter, `atualizar ${activeName}`).catch(() => {});
+    await showQueueMessage(interaction.message, entry.page || 0, interaction.message).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_update_current_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({
+        content: '⏳ A playlist ainda está carregando. Aguarde finalizar para atualizar.',
+        ephemeral: true,
+      });
+    }
+
+    const activeName = getActiveLoadedPlaylist(interaction.guildId);
+    if (!activeName) {
+      return interaction.reply({ content: '❌ Nenhuma playlist carregada para atualizar.', ephemeral: true });
+    }
+
+    const snapshot = getPlaylistSnapshot(interaction.guildId);
+    if (!snapshot) {
+      return interaction.reply({ content: '❌ Não há playlist/fila ativa para atualizar agora.', ephemeral: true });
+    }
+
+    const updated = upsertSavedPlaylist(interaction.guildId, activeName, snapshot);
+    if (!updated.ok) {
+      return interaction.reply({ content: '❌ Não consegui atualizar essa playlist.', ephemeral: true });
+    }
+
+    const total = (snapshot.currentSong ? 1 : 0) + (Array.isArray(snapshot.queue) ? snapshot.queue.length : 0);
+    await interaction.deferUpdate().catch(() => {});
+    await refreshQueueMessagesForGuild(interaction.guildId).catch(() => {});
+    await interaction.followUp({ content: `♻️ Playlist **${updated.name}** atualizada com **${total}** música(s).`, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_saved_list_')) {
+    const entries = listSavedPlaylistEntries(interaction.guildId);
+    if (!entries.length) {
+      return interaction.reply({ content: '💾 Nenhuma playlist salva neste servidor.', ephemeral: true });
+    }
+    const lines = entries.slice(0, 20).map(({ storageName, entry }, idx) => {
+      const when = entry?.updatedAt ? `<t:${Math.floor(new Date(entry.updatedAt).getTime() / 1000)}:R>` : 'sem data';
+      return `**${idx + 1}.** ${storageName} (${when})`;
+    });
+    return interaction.reply({ content: `💾 **Playlists salvas**\n${lines.join('\n')}`, ephemeral: true });
+  }
+
+  if (interaction.customId.startsWith('queue_saved_load_pick_')) {
+    const modal = new ModalBuilder()
+      .setCustomId('queue_saved_load_modal')
+      .setTitle('Carregar playlist salva')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('savedPlaylistLoadRef')
+            .setLabel('Nome ou número da playlist salva')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Ex: 2 ou academia')
+            .setRequired(true)
+        )
+      );
+
+    return interaction.showModal(modal);
+  }
+
+  if (interaction.customId.startsWith('queue_saved_delete_pick_')) {
+    const modal = new ModalBuilder()
+      .setCustomId('queue_saved_delete_modal')
+      .setTitle('Apagar playlist salva')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('savedPlaylistRef')
+            .setLabel('Nome ou número da playlist salva')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Ex: 2 ou academia')
+            .setRequired(true)
+        )
+      );
+
+    return interaction.showModal(modal);
+  }
+
+  if (interaction.customId.startsWith('queue_saved_delete_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+
+    const activeName = getActiveLoadedPlaylist(interaction.guildId);
+    if (!activeName) {
+      return interaction.reply({ content: '❌ Nenhuma playlist carregada para apagar.', ephemeral: true });
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+    const msgAdapter = createInteractionMessageAdapter(interaction);
+    await handlePlaylistCommand(msgAdapter, `apagar ${activeName}`).catch(() => {});
+    await showQueueMessage(interaction.message, entry.page || 0, interaction.message).catch(() => {});
+    return;
+  }
+
+  if (interaction.customId.startsWith('queue_remove_pick_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Remover (#).', ephemeral: true });
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId('queue_remove_modal')
+      .setTitle('Remover música da fila')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('queueRemovePosition')
+            .setLabel('Número da música na fila')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Ex: 5')
+            .setRequired(true)
+        )
+      );
+
+    return interaction.showModal(modal);
+  }
+
   if (interaction.customId.startsWith('queue_loopplaylist_')) {
-    const entry = pendingQueueMessages.get(interaction.message.id);
+    const entry = ensureQueueInteractionState(interaction);
     if (!entry) return interaction.deferUpdate();
     if (isPlaylistLoadInProgress(interaction.guildId)) {
       return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Loop Playlist.', ephemeral: true });
@@ -3712,11 +4715,12 @@ client.on('interactionCreate', async (interaction) => {
     const ps = Number(BOT_CFG.ui?.queuePageSize) || 8;
     const targetPage = loopInfo.enabled ? Math.floor((loopInfo.currentIndex || 0) / ps) : 0;
     await showQueueMessage(interaction.message, targetPage, interaction.message).catch(() => {});
+    await refreshNowPlayingMessage(interaction.guildId).catch(() => {});
     return;
   }
 
   if (interaction.customId.startsWith('queue_restart_')) {
-    const entry = pendingQueueMessages.get(interaction.message.id);
+    const entry = ensureQueueInteractionState(interaction);
     if (!entry) return interaction.deferUpdate();
 
     if (isPlaylistLoadInProgress(interaction.guildId)) {
@@ -3736,6 +4740,8 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.customId.startsWith('queue_play_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
     if (isPlaylistLoadInProgress(interaction.guildId)) {
       return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para usar Tocar (#).', ephemeral: true });
     }
@@ -3749,6 +4755,29 @@ client.on('interactionCreate', async (interaction) => {
             .setLabel('Número da música na fila')
             .setStyle(TextInputStyle.Short)
             .setPlaceholder('Ex: 5')
+            .setRequired(true)
+        )
+      );
+
+    return interaction.showModal(modal);
+  }
+
+  if (interaction.customId.startsWith('queue_save_pick_')) {
+    const entry = ensureQueueInteractionState(interaction);
+    if (!entry) return interaction.deferUpdate();
+    if (isPlaylistLoadInProgress(interaction.guildId)) {
+      return interaction.reply({ content: '⏳ A playlist ainda está carregando. Aguarde finalizar para salvar playlist.', ephemeral: true });
+    }
+    const modal = new ModalBuilder()
+      .setCustomId('queue_save_modal')
+      .setTitle('Salvar playlist atual')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('playlistName')
+            .setLabel('Nome da playlist')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Ex: academia')
             .setRequired(true)
         )
       );

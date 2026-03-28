@@ -52,7 +52,7 @@ const DEFAULT_CONFIG = {
       soundCloudProgressScanLimit: 30,
     },
     commands: {
-      defaultPrefixes: ['+Ducz', '+d', '+p', '+play', '+tocar', '+skip', '+pular', '+stop', '+parar', '+sair', '+leave', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+clear', '+help', '+ajuda', '+prefix'],
+      defaultPrefixes: ['+Ducz', '+d', '+p', '+play', '+tocar', '+skip', '+pular', '+stop', '+parar', '+sair', '+leave', '+i', '+fav', '+efeito', '+efeitos', '+effect', '+ef', '+fila', '+queue', '+remove', '+rm', '+playlist', '+pl', '+clear', '+help', '+ajuda', '+prefix'],
     },
   },
   sources: {

@@ -106,24 +106,59 @@ Aliases legados ainda aceitos: +d e +Ducz.
 
 ### Reproducao
 
-- +i <texto|link-myinstants> (instant)
-  - Reaja com 🦆 para repetir o instant
-  - Reaja com 📢 para tocar mais alto uma unica vez (volume configuravel em bot.json → sfx.megaphoneVolume)
-  - Reaja com ⭐ para salvar/remover dos favoritos com uma unica mensagem de status por instant equivalente no canal
-- +p <texto|link-youtube|link-soundcloud|link-spotify>
-- +p tocar <texto|link>
-- +p play <text|link>
+- PT-BR:
+  - +p <texto|link-youtube|link-soundcloud|link-spotify>
+  - +tocar <texto|link>
+  - +i <texto|link-myinstants> (instant)
+- EN:
+  - +play <text|link>
+  - +i <text|myinstants-link>
+- Reacoes no +i:
+  - 🦆 repetir instant
+  - 📢 tocar mais alto uma unica vez (volume em bot.json → sfx.megaphoneVolume)
+  - ⭐ salvar/remover dos favoritos com uma unica mensagem de status por instant equivalente no canal
 
 ### Controle de fila
 
-- +skip
-- +stop
-- +pular
-- +parar
-- +sair / +leave
-- +fila
-- +queue
-- +fila <numero>
+- Navegacao:
+  - +fila
+  - +queue
+  - +fila <numero>
+- Remocao por posicao:
+  - +fila remove <numero>
+  - +queue remove <numero>
+  - +remove <numero>
+  - +rm <numero>
+- Remocao da musica atual:
+  - +fila remove atual
+  - +remove atual
+  - +rm atual
+- Controle rapido:
+  - +skip / +pular
+  - +stop / +parar
+  - +sair / +leave
+
+### Playlists salvas
+
+- PT-BR:
+  - +fila listar
+  - +fila salvar <nome>
+  - +fila carregar <nome|numero>
+  - +fila atualizar <nome>
+  - +fila apagar <nome|numero>
+- EN:
+  - +fila list
+  - +fila save <name>
+  - +fila load <name|number>
+  - +fila update <name>
+  - +fila delete <name|number>
+- Atalhos:
+  - +playlist <acao> <referencia>
+  - +pl <acao> <referencia>
+- Botoes no +fila:
+  - Tocar (#), Remover (#), Reiniciar, Loop Playlist
+  - Atualizar Playlist, Apagar Playlist
+  - Carregar salva (#/nome), Playlists salvas, Apagar salva (#/nome), Descartar
 
 ### Efeitos
 
@@ -155,25 +190,46 @@ Aliases legados ainda aceitos: +d e +Ducz.
 
 ## Slash commands (/)
 
-- /play query:<texto|link>
-- /instants query:<texto|link-myinstants>
-- /queue [posicao]
-- /skip
-- /stop
-- /effect acao:<ativar|off|status|lista> [nome] [intensidade]
-- /prefix acao:<view|set|reset> [valor]
-- /leave
-- /help
-- /killbot
+- Midia:
+  - /play query:<texto|link>
+  - /instants query:<texto|link-myinstants>
+- Fila e playlist:
+  - /queue [posicao]
+  - /remove alvo:<atual|posicao> [posicao]
+  - /playlist acao:<listar|salvar|carregar|atualizar|apagar> [referencia]
+- Controle:
+  - /skip
+  - /stop
+  - /leave
+- Ajustes:
+  - /effect acao:<ativar|off|status|lista> [nome] [intensidade]
+  - /prefix acao:<view|set|reset> [valor]
+- Utilitarios:
+  - /help
+  - /killbot
 
 ## Ajuda in-app
 
 - +help abre painel de ajuda com botao "Fechar"
 - /help abre o mesmo painel com botao "Fechar"
-- +fila possui botao de descarte e paginação
+- +fila possui paginação e controles: Tocar (#), Remover (#), Reiniciar, Loop Playlist,
+  Atualizar Playlist, Apagar Playlist, Carregar salva (#/nome), Playlists salvas,
+  Apagar salva (#/nome), Descartar
 - qualquer pessoa do canal pode interagir com os botoes de help/fila/efeitos
 
 ## Historico de modificacoes
+
+### 2026-03-28 - playlists salvas, fila e UX de painel
+
+- Novo: sistema de playlists salvas com suporte completo via +fila, +playlist e +pl
+- Novo: carregar/apagar playlist salva por nome ou por numero da listagem
+- Novo: botao no +fila para carregar salva por numero/nome (modal)
+- Novo: salvar/atualizar playlist pelo painel +fila com estado de playlist ativa
+- UX: reorganizacao dos botoes do painel +fila (reiniciar, loop, atualizar/apagar, carregar/listar/apagar salva, descartar)
+- UX: remocao da musica atual movida para o painel "Tocando" (nao mais no +fila)
+- Fix: restart da playlist respeitando estado da sessao e sem reintroduzir musica removida
+- Docs: +help, README e DOCUMENTACAO atualizados com todos os fluxos novos
+- Slash: adicionados /playlist e /remove, com suporte a referencia por nome ou numero
 
 ### v2.1.0 — 2026-03-20 (release atual)
 
