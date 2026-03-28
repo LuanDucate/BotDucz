@@ -65,6 +65,7 @@ function getGuildData(guildId) {
       effectApplyTimer: null,
       playNextTimer: null,
       externalMoveGraceUntil: 0,
+      removedSongKeys: new Set(),
     });
   }
   const data = guilds.get(guildId);
@@ -112,6 +113,46 @@ function buildCanonicalPlaylist(data) {
   return uniq.map((s) => ({ ...s }));
 }
 
+function buildSessionPlaylist(data) {
+  if (!data) return [];
+  const all = [
+    ...(Array.isArray(data.history) ? data.history : []),
+    ...(data.currentSong ? [data.currentSong] : []),
+    ...(Array.isArray(data.queue) ? data.queue : []),
+  ];
+
+  const seenSeq = new Set();
+  const seenFallback = new Set();
+  const uniq = [];
+
+  for (const song of all) {
+    if (!song) continue;
+    if (isSongMarkedRemoved(data, song)) continue;
+    const seq = Number(song.sequence);
+    if (Number.isFinite(seq)) {
+      const k = `seq:${seq}`;
+      if (seenSeq.has(k)) continue;
+      seenSeq.add(k);
+      uniq.push(song);
+      continue;
+    }
+
+    const k = `fallback:${String(song.url || '')}|${String(song.title || '')}`;
+    if (seenFallback.has(k)) continue;
+    seenFallback.add(k);
+    uniq.push(song);
+  }
+
+  // Ordem estável pela sequência original de inserção.
+  uniq.sort((a, b) => {
+    const sa = Number.isFinite(Number(a?.sequence)) ? Number(a.sequence) : Number.MAX_SAFE_INTEGER;
+    const sb = Number.isFinite(Number(b?.sequence)) ? Number(b.sequence) : Number.MAX_SAFE_INTEGER;
+    return sa - sb;
+  });
+
+  return uniq.map((s) => ({ ...s }));
+}
+
 function findSongIndexInList(list, target) {
   if (!Array.isArray(list) || !target) return -1;
   return list.findIndex((song) => {
@@ -121,6 +162,61 @@ function findSongIndexInList(list, target) {
     }
     return song.url === target.url && song.title === target.title;
   });
+}
+
+function songsMatch(a, b) {
+  if (!a || !b) return false;
+  if (Number.isFinite(Number(a.sequence)) && Number.isFinite(Number(b.sequence))) {
+    return Number(a.sequence) === Number(b.sequence);
+  }
+  return String(a.url || '') === String(b.url || '') && String(a.title || '') === String(b.title || '');
+}
+
+function getSongKey(song) {
+  if (!song) return '';
+  const seq = Number(song.sequence);
+  if (Number.isFinite(seq)) return `seq:${seq}`;
+  return `fallback:${String(song.url || '')}|${String(song.title || '')}`;
+}
+
+function markSongAsRemoved(data, song) {
+  if (!data || !song) return;
+  if (!(data.removedSongKeys instanceof Set)) data.removedSongKeys = new Set();
+  const key = getSongKey(song);
+  if (key) data.removedSongKeys.add(key);
+}
+
+function isSongMarkedRemoved(data, song) {
+  if (!data || !song) return false;
+  if (!(data.removedSongKeys instanceof Set)) return false;
+  const key = getSongKey(song);
+  return key ? data.removedSongKeys.has(key) : false;
+}
+
+function clearRemovedSongMarks(data) {
+  if (!data) return;
+  data.removedSongKeys = new Set();
+}
+
+function removeSongFromAllCollections(data, targetSong) {
+  if (!data || !targetSong) return;
+
+  markSongAsRemoved(data, targetSong);
+
+  if (Array.isArray(data.history)) {
+    data.history = data.history.filter((song) => !songsMatch(song, targetSong));
+  }
+  if (Array.isArray(data.queue)) {
+    data.queue = data.queue.filter((song) => !songsMatch(song, targetSong));
+  }
+  if (Array.isArray(data.playlistFull)) {
+    data.playlistFull = data.playlistFull.filter((song) => !songsMatch(song, targetSong));
+  }
+
+  if (data.currentSong && songsMatch(data.currentSong, targetSong)) {
+    data.currentSong = null;
+    data.currentSongOffsetSeconds = 0;
+  }
 }
 
 function trimHistoryIfNeeded(data) {
@@ -135,14 +231,14 @@ function getLoopPlaylistView(data) {
     return { songs: [], currentIndex: -1 };
   }
 
-  const songs = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+  const songs = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildSessionPlaylist(data);
   const currentIndex = findSongIndexInList(songs, data.currentSong);
   return { songs, currentIndex };
 }
 
 function refreshLoopPlaylistSnapshot(data) {
   if (!data) return;
-  data.playlistFull = buildCanonicalPlaylist(data);
+  data.playlistFull = buildSessionPlaylist(data);
 }
 
 function setEffect(guildId, effect) {
@@ -163,6 +259,7 @@ function buildMusicControlRow(guildId) {
   const loopActive = data?.loop || false;
   const hasPrevious = Array.isArray(data?.history) && data.history.length > 0;
   const hasNext = Array.isArray(data?.queue) && data.queue.length > 0;
+  const hasCurrent = Boolean(data?.currentSong);
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`music_prev_${guildId}`)
@@ -182,6 +279,11 @@ function buildMusicControlRow(guildId) {
       .setCustomId(`music_loop_${guildId}`)
       .setEmoji('🔁')
       .setStyle(loopActive ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`music_remove_current_${guildId}`)
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!hasCurrent),
   );
 }
 
@@ -239,12 +341,38 @@ function cleanupOldStream(data, old) {
   }, Number(MQ_CFG.cleanupOldStreamDelayMs) || 250);
 }
 
-function buildNowPlayingContent(song, queueSize, effect, effectIntensity, currentSequence = 0) {
-  const sequenceMsg = currentSequence > 0 ? ` | #${currentSequence}` : '';
-  const queueMsg = queueSize > 0 ? ` | ${queueSize} na fila` : '';
-  const effectMsg = effect ? ` | 🎛️ ${effect} ${effectIntensity}/10` : '';
+function buildNowPlayingContent(data) {
+  const song = data?.currentSong;
+  const queueSize = Array.isArray(data?.queue) ? data.queue.length : 0;
+  const effect = data?.effect;
+  const effectIntensity = data?.effectIntensity || 5;
+  const lines = [`🎶 Tocando: **${song?.title || 'música'}**`];
+
+  if (data?.loopPlaylist) {
+    const loopView = getLoopPlaylistView(data);
+    const totalSongs = Array.isArray(loopView.songs) ? loopView.songs.length : 0;
+    const currentPos = (loopView.currentIndex || 0) >= 0 ? (loopView.currentIndex + 1) : 1;
+    lines.push(`📋 Fila: ${currentPos} / ${Math.max(1, totalSongs)}`);
+  } else if (queueSize > 0) {
+    const playedCount = Array.isArray(data?.history) ? data.history.length : 0;
+    const currentPos = playedCount + 1;
+    const totalSongs = playedCount + 1 + queueSize;
+    lines.push(`📋 Fila: ${currentPos} / ${totalSongs}`);
+  }
+
+  if (effect) {
+    lines.push(`🎛️ Efeito: ${effect} ${effectIntensity}/10`);
+  }
+
+  const loops = [];
+  if (data?.loopPlaylist) loops.push('playlist');
+  if (data?.loop) loops.push('música');
+  if (loops.length > 0) {
+    lines.push(`🔁 Loops: ${loops.join(', ')}`);
+  }
+
   const linkRef = song?.url && song.url.startsWith('http') ? `\n🔗 ${song.url}` : '';
-  return `🎶 Tocando: **${song?.title || 'música'}**${sequenceMsg}${queueMsg}${effectMsg}${linkRef}`;
+  return `${lines.join('\n')}${linkRef}`;
 }
 
 async function upsertNowPlayingMessage(guildId, opts = {}) {
@@ -253,7 +381,7 @@ async function upsertNowPlayingMessage(guildId, opts = {}) {
   const forceResend = Boolean(opts?.forceResend);
 
   const payload = {
-    content: buildNowPlayingContent(data.currentSong, data.queue.length, data.effect, data.effectIntensity || 5, data.currentSequence || 0),
+    content: buildNowPlayingContent(data),
     components: [buildMusicControlRow(guildId)],
   };
 
@@ -263,17 +391,30 @@ async function upsertNowPlayingMessage(guildId, opts = {}) {
     .then(async () => {
       if (!data.currentSong || !data.textChannel) return false;
 
-      if (data.nowPlayingMessage && !forceResend) {
+      if (forceResend && data.nowPlayingMessage) {
+        let shouldResend = true;
+
+        // Se o now playing já for a última mensagem do canal, basta editar.
+        if (data.textChannel?.messages?.fetch) {
+          const latestBatch = await data.textChannel.messages.fetch({ limit: 1 }).catch(() => null);
+          const latestMsg = latestBatch?.first?.();
+          if (latestMsg?.id === data.nowPlayingMessage.id) {
+            shouldResend = false;
+          }
+        }
+
+        if (shouldResend) {
+          await data.nowPlayingMessage.delete().catch(() => {});
+          data.nowPlayingMessage = null;
+        }
+      }
+
+      if (data.nowPlayingMessage) {
         const updated = await data.nowPlayingMessage.edit(payload).catch(() => null);
         if (updated) {
           data.nowPlayingMessage = updated;
           return true;
         }
-      }
-
-      if (data.nowPlayingMessage && forceResend) {
-        await data.nowPlayingMessage.delete().catch(() => {});
-        data.nowPlayingMessage = null;
       }
 
       const sendPayload = data.anchorMessageId && data.anchorNowPlayingEnabled !== false
@@ -347,8 +488,25 @@ function playSong(guildId, song, seekSeconds = 0, smoothSwitch = false) {
   data.currentSequence = Number.isFinite(song?.sequence) ? song.sequence : (data.currentSequence || 0);
   const songChanged = previousSong !== song;
 
+  const logMeta = [];
+  if (data.loopPlaylist) {
+    const loopView = getLoopPlaylistView(data);
+    const totalSongs = Array.isArray(loopView.songs) ? loopView.songs.length : 0;
+    if ((loopView.currentIndex || 0) >= 0 && totalSongs > 0) {
+      logMeta.push(`${loopView.currentIndex + 1} / ${totalSongs}`);
+    }
+    logMeta.push('loop playlist ativo');
+  }
+  if (data.loop) {
+    logMeta.push('loop música ativo');
+  }
+
+  const songLabel = logMeta.length > 0
+    ? `${song.title} (${logMeta.join(', ')})`
+    : song.title;
+
   console.log(
-    `🎶 Tocando: ${song.title} (efeito: ${data.effect || 'nenhum'}, seek: ${seekSeconds}s)`
+    `🎶 Tocando: ${songLabel} (efeito: ${data.effect || 'nenhum'}, seek: ${seekSeconds}s)`
   );
 
   // Quando trocamos de efeito ou de música, mantemos o stream antigo por um curto período
@@ -1083,7 +1241,7 @@ async function playNext(guildId) {
     if (data.queue.length === 0) {
       if (data.loopPlaylist) {
         // Loop de playlist: reabastece a fila do início usando snapshot canônico.
-        const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
+        const full = data.playlistFull.length > 0 ? data.playlistFull : buildSessionPlaylist(data);
         if (full.length === 0) {
           data.currentSong = null;
           if (data.nowPlayingMessage) {
@@ -1128,7 +1286,7 @@ async function playNext(guildId) {
       if (data.queue.length > 0) {
         schedulePlayNext(guildId, PLAY_NEXT_ERROR_DELAY_MS);
       } else if (data.loopPlaylist) {
-        const full = data.playlistFull.length > 0 ? data.playlistFull : buildCanonicalPlaylist(data);
+        const full = data.playlistFull.length > 0 ? data.playlistFull : buildSessionPlaylist(data);
         if (full.length === 0) return;
         data.playlistFull = full.map((s) => ({ ...s }));
         data.queue = full.map(s => ({ ...s }));
@@ -1152,8 +1310,11 @@ async function addYouTube(message, url, title) {
   const data = await ensureConnection(message);
   const startingFreshSession = !data.currentSong && data.queue.length === 0;
   if (startingFreshSession) {
+    clearRemovedSongMarks(data);
     data.history = [];
     data.playlistFull = [];
+    data.loop = false;
+    data.loopPlaylist = false;
   }
   const song = { url, title: title || 'vídeo do YouTube' };
   if (!Number.isFinite(song.sequence)) {
@@ -1193,8 +1354,11 @@ async function addPlaylist(message, videos, opts = {}) {
   const data = await ensureConnection(message);
   const startingFreshSession = !data.currentSong && data.queue.length === 0;
   if (startingFreshSession) {
+    clearRemovedSongMarks(data);
     data.history = [];
     data.playlistFull = [];
+    data.loop = false;
+    data.loopPlaylist = false;
   }
 
   // CRITICAL: isActive deve considerar Buffering também, senão playNext() é chamado prematuramente!
@@ -1438,6 +1602,7 @@ async function stop(message, replyFn = (text) => message.reply(text)) {
   data.loop = false;
   data.loopPlaylist = false;
   data.playlistFull = [];
+  clearRemovedSongMarks(data);
   data.musicPausedForSfx = false;
   data.advanceInProgress = false;
   data.advanceRequested = false;
@@ -1455,6 +1620,8 @@ function leave(message) {
     message.reply('❌ Não estou em nenhum canal de voz.');
     return;
   }
+
+  clearRemovedSongMarks(data);
 
   if (data.nowPlayingMessage) {
     data.nowPlayingMessage.delete().catch(() => {});
@@ -1547,6 +1714,7 @@ function cleanup(guildId) {
   data.history = [];
   data.loopPlaylist = false;
   data.playlistFull = [];
+  clearRemovedSongMarks(data);
   data.musicPausedForSfx = false;
   data.advanceInProgress = false;
   data.advanceRequested = false;
@@ -1574,12 +1742,139 @@ function getQueue(guildId) {
   };
 }
 
+async function removeCurrentSong(guildId) {
+  const data = guilds.get(guildId);
+  if (!data || !data.currentSong) {
+    return { ok: false, reason: 'no-current' };
+  }
+
+  if (data.loopPlaylist) {
+    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildSessionPlaylist(data);
+    const currentIndex = findSongIndexInList(full, data.currentSong);
+    if (currentIndex < 0) {
+      return { ok: false, reason: 'invalid-position' };
+    }
+    return removeQueuePosition(guildId, currentIndex + 1);
+  }
+
+  const removedSong = data.currentSong;
+
+  if (data.queue.length > 0) {
+    const nextSong = data.queue.shift();
+    if (!nextSong) {
+      data.currentSong = null;
+      return { ok: false, reason: 'empty' };
+    }
+
+    await ensurePlayableSong(nextSong).catch(() => {});
+    playSong(guildId, nextSong, 0, true);
+    removeSongFromAllCollections(data, removedSong);
+    await refreshNowPlayingMessage(guildId).catch(() => {});
+    refreshLoopPlaylistSnapshot(data);
+    return { ok: true, removedSong, removedCurrent: true };
+  }
+
+  data.currentSong = null;
+  data.currentSongOffsetSeconds = 0;
+  cleanupCurrentStream(data);
+  if (data.musicPlayer) data.musicPlayer.stop();
+
+  if (data.nowPlayingMessage) {
+    data.nowPlayingMessage.delete().catch(() => {});
+    data.nowPlayingMessage = null;
+  }
+
+  if (typeof onSongChangedCallback === 'function') {
+    Promise.resolve(onSongChangedCallback(guildId, null)).catch(() => {});
+  }
+
+  removeSongFromAllCollections(data, removedSong);
+  refreshLoopPlaylistSnapshot(data);
+  return { ok: true, removedSong, removedCurrent: true };
+}
+
+async function removeQueuePosition(guildId, position) {
+  const data = guilds.get(guildId);
+  if (!data) return { ok: false, reason: 'missing-guild' };
+
+  const idx = Math.floor(Number(position)) - 1;
+  if (!Number.isFinite(idx) || idx < 0) {
+    return { ok: false, reason: 'invalid-position' };
+  }
+
+  if (data.loopPlaylist) {
+    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildSessionPlaylist(data);
+    if (idx >= full.length) {
+      return { ok: false, reason: 'invalid-position' };
+    }
+
+    const removedSong = full[idx];
+    markSongAsRemoved(data, removedSong);
+    const currentIndex = findSongIndexInList(full, data.currentSong);
+    if (currentIndex < 0) {
+      return { ok: false, reason: 'invalid-position' };
+    }
+
+    const nextFull = full.filter((_, i) => i !== idx).map((song) => ({ ...song }));
+
+    if (nextFull.length === 0) {
+      data.playlistFull = [];
+      data.history = [];
+      data.queue = [];
+      data.currentSong = null;
+      data.currentSongOffsetSeconds = 0;
+      cleanupCurrentStream(data);
+      if (data.musicPlayer) data.musicPlayer.stop();
+      if (data.nowPlayingMessage) {
+        data.nowPlayingMessage.delete().catch(() => {});
+        data.nowPlayingMessage = null;
+      }
+      if (typeof onSongChangedCallback === 'function') {
+        Promise.resolve(onSongChangedCallback(guildId, null)).catch(() => {});
+      }
+      return { ok: true, removedSong, removedCurrent: true, queueEmpty: true };
+    }
+
+    if (idx === currentIndex) {
+      const nextIndex = Math.min(idx, nextFull.length - 1);
+      const nextSong = nextFull[nextIndex];
+
+      data.playlistFull = nextFull.map((song) => ({ ...song }));
+      data.history = nextFull.slice(0, nextIndex).map((song) => ({ ...song }));
+      data.queue = nextFull.slice(nextIndex + 1).map((song) => ({ ...song }));
+
+      await ensurePlayableSong(nextSong).catch(() => {});
+      playSong(guildId, { ...nextSong }, 0, true);
+      await refreshNowPlayingMessage(guildId).catch(() => {});
+
+      return { ok: true, removedSong, removedCurrent: true };
+    }
+
+    const nextCurrentIndex = idx < currentIndex ? currentIndex - 1 : currentIndex;
+    data.playlistFull = nextFull.map((song) => ({ ...song }));
+    data.history = nextFull.slice(0, nextCurrentIndex).map((song) => ({ ...song }));
+    data.queue = nextFull.slice(nextCurrentIndex + 1).map((song) => ({ ...song }));
+
+    return { ok: true, removedSong, removedCurrent: false };
+  }
+
+  if (idx >= data.queue.length) {
+    return { ok: false, reason: 'invalid-position' };
+  }
+
+  const [removedSong] = data.queue.splice(idx, 1);
+  if (!removedSong) return { ok: false, reason: 'invalid-position' };
+  removeSongFromAllCollections(data, removedSong);
+  refreshLoopPlaylistSnapshot(data);
+  return { ok: true, removedSong, removedCurrent: false };
+}
+
 async function jumpTo(guildId, position) {
   const data = guilds.get(guildId);
   if (!data) return false;
 
   if (data.loopPlaylist) {
-    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildCanonicalPlaylist(data);
+    const full = data.playlistFull.length > 0 ? data.playlistFull.map((song) => ({ ...song })) : buildSessionPlaylist(data);
     const idx = Math.floor(position) - 1;
     if (isNaN(idx) || idx < 0 || idx >= full.length) return false;
 
@@ -1639,7 +1934,7 @@ function toggleLoopPlaylist(guildId) {
   data.loopPlaylist = !data.loopPlaylist;
   if (data.loopPlaylist) {
     // Snapshot canônico por ordem original (sequence), robusto para jump/skip durante carregamento.
-    data.playlistFull = buildCanonicalPlaylist(data);
+    data.playlistFull = buildSessionPlaylist(data);
     const currentIndex = Math.max(0, findSongIndexInList(data.playlistFull, data.currentSong));
     return { enabled: true, currentIndex, total: data.playlistFull.length };
   } else {
@@ -1671,16 +1966,13 @@ function getQueueFull(guildId) {
 function restartPlaylist(guildId) {
   const data = guilds.get(guildId);
   if (!data) return false;
-  const canonical = buildCanonicalPlaylist(data);
-  const full = (data.loopPlaylist && data.playlistFull.length > 0)
-    ? data.playlistFull
-    : canonical;
+  // Reinicia sempre com base no estado real da sessão (history + atual + fila)
+  // para não herdar entradas residuais em playlistFull.
+  const full = buildSessionPlaylist(data);
   if (full.length === 0) return false;
   const freshList = full.map(s => ({ ...s }));
-  if (data.loopPlaylist) {
-    // Mantém snapshot limpo/canônico para os próximos ciclos.
-    data.playlistFull = freshList.map(s => ({ ...s }));
-  }
+  // Mantém snapshot limpo/canônico para os próximos ciclos e para novos restarts.
+  data.playlistFull = freshList.map(s => ({ ...s }));
   data.history = [];
   data.queue = freshList.slice(1);
   playSong(guildId, freshList[0], 0, true);
@@ -1722,6 +2014,122 @@ function setNowPlayingAnchorEnabled(guildId, enabled) {
   data.anchorNowPlayingEnabled = Boolean(enabled);
 }
 
+function cloneSongs(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter(Boolean).map((song) => ({ ...song }));
+}
+
+function getMaxSequenceFromSongs(...lists) {
+  let maxSeq = 0;
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const song of list) {
+      const seq = Number(song?.sequence);
+      if (Number.isFinite(seq) && seq > maxSeq) maxSeq = seq;
+    }
+  }
+  return maxSeq;
+}
+
+function getPlaylistSnapshot(guildId) {
+  const data = guilds.get(guildId);
+  if (!data) return null;
+
+  const currentSong = data.currentSong ? { ...data.currentSong } : null;
+  const queue = cloneSongs(data.queue);
+  if (!currentSong && queue.length === 0) return null;
+
+  const history = cloneSongs(data.history);
+  const playlistFull = cloneSongs(buildSessionPlaylist(data));
+  const maxSequence = getMaxSequenceFromSongs(history, currentSong ? [currentSong] : [], queue, playlistFull);
+
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    currentSong,
+    queue,
+    history,
+    loop: Boolean(data.loop),
+    loopPlaylist: Boolean(data.loopPlaylist),
+    playlistFull,
+    effect: data.effect || null,
+    effectIntensity: Math.max(1, Math.min(10, Math.floor(data.effectIntensity || 5))),
+    sequenceCounter: Math.max(Number(data.sequenceCounter) || 0, maxSequence),
+  };
+}
+
+async function restorePlaylistSnapshot(message, snapshot) {
+  if (!message?.guildId || !snapshot || typeof snapshot !== 'object') {
+    return { ok: false, reason: 'invalid-snapshot' };
+  }
+
+  const data = await ensureConnection(message);
+
+  const hadActiveResource = Boolean(data.currentStream) || Boolean(data.currentSong);
+  if (hadActiveResource) {
+    data.suppressNextIdleCount = (data.suppressNextIdleCount || 0) + 1;
+    data.suppressNextErrorAdvanceCount = (data.suppressNextErrorAdvanceCount || 0) + 1;
+    data.suppressAdvanceUntil = Date.now() + ADVANCE_SUPPRESSION_WINDOW_MS;
+  }
+
+  clearScheduledTimers(data);
+  cleanupCurrentStream(data);
+  if (data.musicPlayer) data.musicPlayer.stop();
+  if (data.sfxPlayer) data.sfxPlayer.stop();
+
+  const restoredCurrent = snapshot.currentSong ? { ...snapshot.currentSong } : null;
+  const restoredQueue = cloneSongs(snapshot.queue);
+  const restoredHistory = cloneSongs(snapshot.history);
+  const restoredPlaylistFull = cloneSongs(snapshot.playlistFull);
+
+  if (!restoredCurrent && restoredQueue.length === 0) {
+    return { ok: false, reason: 'empty-snapshot' };
+  }
+
+  data.loop = Boolean(snapshot.loop);
+  data.loopPlaylist = Boolean(snapshot.loopPlaylist);
+  clearRemovedSongMarks(data);
+  data.effect = snapshot.effect || null;
+  data.effectIntensity = Math.max(1, Math.min(10, Math.floor(snapshot.effectIntensity || 5)));
+  data.history = restoredHistory;
+  data.queue = restoredQueue;
+  data.playlistFull = restoredPlaylistFull;
+  data.currentSong = restoredCurrent;
+  data.currentSongOffsetSeconds = 0;
+  data.currentSequence = Number.isFinite(Number(restoredCurrent?.sequence))
+    ? Number(restoredCurrent.sequence)
+    : 0;
+  data.sequenceCounter = Math.max(
+    Number(snapshot.sequenceCounter) || 0,
+    getMaxSequenceFromSongs(data.history, data.currentSong ? [data.currentSong] : [], data.queue, data.playlistFull)
+  );
+
+  if (data.loopPlaylist && data.playlistFull.length === 0) {
+    refreshLoopPlaylistSnapshot(data);
+  }
+
+  if (data.currentSong) {
+    const targetSong = { ...data.currentSong };
+    data.currentSong = null;
+    await ensurePlayableSong(targetSong).catch(() => {});
+    playSong(message.guildId, targetSong, 0, true);
+    await refreshNowPlayingMessage(message.guildId, { forceResend: true }).catch(() => {});
+    return {
+      ok: true,
+      currentTitle: targetSong.title || 'música',
+      totalSongs: (data.currentSong ? 1 : 0) + data.queue.length,
+    };
+  }
+
+  await playNext(message.guildId).catch(() => {});
+  await refreshNowPlayingMessage(message.guildId, { forceResend: true }).catch(() => {});
+  return {
+    ok: true,
+    currentTitle: data.currentSong?.title || 'música',
+    totalSongs: (data.currentSong ? 1 : 0) + data.queue.length,
+  };
+}
+
 module.exports = {
   addYouTube,
   addPlaylist,
@@ -1731,6 +2139,10 @@ module.exports = {
   leave,
   getQueue,
   getQueueFull,
+  getPlaylistSnapshot,
+  restorePlaylistSnapshot,
+  removeCurrentSong,
+  removeQueuePosition,
   ensureConnection,
   jumpTo,
   getEffectList,

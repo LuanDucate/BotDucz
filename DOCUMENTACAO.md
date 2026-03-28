@@ -43,26 +43,58 @@ Tambem inclui:
 
 ### 4.1 Prefixo - reproducao
 
-- +i <texto|link-myinstants> (instant)
-  - Reaja com 🦆 para repetir o instant
-  - Reaja com 📢 para tocar mais alto uma unica vez (volume via bot.json → sfx.megaphoneVolume)
-  - Reaja com ⭐ para salvar/remover dos favoritos compartilhados com uma unica mensagem de status por instant equivalente no canal
-- +p <texto|link>
-- +p tocar <texto|link>
-- +p play <text|link>
-- alias legado ainda aceito: +d / +Ducz
+- PT-BR:
+  - +p <texto|link>
+  - +tocar <texto|link>
+  - +i <texto|link-myinstants> (instant)
+- EN:
+  - +play <text|link>
+  - +i <text|myinstants-link>
+- Reacoes no +i:
+  - 🦆 repetir instant
+  - 📢 tocar mais alto uma unica vez (volume em bot.json → sfx.megaphoneVolume)
+  - ⭐ salvar/remover dos favoritos compartilhados com uma unica mensagem de status por instant equivalente no canal
+- Alias legado aceito: +d / +Ducz
 
 ### 4.2 Prefixo - fila/controle
 
-- +fila
-- +fila <n>
-- +skip
-- +stop
-- +pular
-- +parar
-- +sair / +leave
+- Navegacao:
+  - +fila
+  - +queue
+  - +fila <n>
+- Remocao por posicao:
+  - +fila remove <n>
+  - +queue remove <n>
+  - +remove <n>
+  - +rm <n>
+- Remocao da musica atual:
+  - +fila remove atual
+  - +remove atual
+  - +rm atual
+- Controle rapido:
+  - +skip / +pular
+  - +stop / +parar
+  - +sair / +leave
 
-### 4.3 Prefixo - efeitos
+### 4.3 Prefixo - playlists salvas
+
+- PT-BR:
+  - +fila listar
+  - +fila salvar <nome>
+  - +fila carregar <nome|numero>
+  - +fila atualizar <nome>
+  - +fila apagar <nome|numero>
+- EN:
+  - +fila list
+  - +fila save <name>
+  - +fila load <name|number>
+  - +fila update <name>
+  - +fila delete <name|number>
+- Atalhos:
+  - +playlist <acao> <referencia>
+  - +pl <acao> <referencia>
+
+### 4.4 Prefixo - efeitos
 
 - +efeito <nome> [1-10]
 - +ef <nome> [1-10]
@@ -71,14 +103,14 @@ Tambem inclui:
 - +ef off
 - +ef lista
 
-### 4.4 Prefixo - favoritos
+### 4.5 Prefixo - favoritos
 
 - Lista compartilhada por todos no servidor
 - +fav
 - +fav <numero>
 - +fav remove <numero>
 
-### 4.5 Prefixo - utilitarios
+### 4.6 Prefixo - utilitarios
 
 - +help
 - +ajuda
@@ -89,18 +121,25 @@ Tambem inclui:
 - +clear <1m|2h|1d>
 - +killbot (owner)
 
-### 4.6 Slash commands (/)
+### 4.7 Slash commands (/)
 
-- /play query:<texto|link>
-- /instants query:<texto|link-myinstants>
-- /queue [posicao]
-- /skip
-- /stop
-- /effect acao:<ativar|off|status|lista> [nome] [intensidade]
-- /prefix acao:<view|set|reset> [valor]
-- /leave
-- /help
-- /killbot
+- Midia:
+  - /play query:<texto|link>
+  - /instants query:<texto|link-myinstants>
+- Fila e playlist:
+  - /queue [posicao]
+  - /remove alvo:<atual|posicao> [posicao]
+  - /playlist acao:<listar|salvar|carregar|atualizar|apagar> [referencia]
+- Controle:
+  - /skip
+  - /stop
+  - /leave
+- Ajustes:
+  - /effect acao:<ativar|off|status|lista> [nome] [intensidade]
+  - /prefix acao:<view|set|reset> [valor]
+- Utilitarios:
+  - /help
+  - /killbot
 
 ## 5. Ajuda no Discord
 
@@ -111,6 +150,8 @@ Painel de ajuda:
 Comportamento:
 - painel de ajuda com embed atualizado
 - botao "Fechar" para remover a mensagem de ajuda
+- painel +fila com controles de playlist: Loop Playlist, Atualizar Playlist, Apagar Playlist,
+  Carregar salva (#/nome), Playlists salvas, Apagar salva (#/nome), Descartar
 - qualquer usuario pode interagir e fechar
 
 ## 6. Presenca e resumo operacional (bio visivel)
@@ -146,6 +187,17 @@ Texto recomendado:
 - favorites.json: armazenamento de favoritos compartilhados
 
 ## 9. Historico de modificacoes (organizado por data)
+
+### 2026-03-28 - playlists salvas, fila e slash
+
+- Playlists salvas com fluxo completo em +fila, +playlist e +pl
+- Carregar e apagar playlist por nome ou numero da listagem
+- Botao de carregar salva (#/nome) no painel +fila com modal
+- Ajustes de layout no painel +fila (reiniciar, loop, atualizar/apagar, carregar/listar/apagar salva, descartar)
+- Remocao da musica atual movida para o painel de "Tocando"
+- Correcao do restart para respeitar estado real da playlist/sessao sem ressuscitar removidas
+- +help atualizado com os novos fluxos e botoes
+- Slash commands atualizados com /playlist e /remove
 
 ### v2.1.0 — 2026-03-20 (release atual)
 
